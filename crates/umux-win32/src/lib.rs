@@ -5,7 +5,21 @@ use thiserror::Error;
 pub const CRATE_NAME: &str = "umux-win32";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeWindowHandle(pub isize);
+pub struct NativeWindowHandle(isize);
+
+impl NativeWindowHandle {
+    pub fn new(raw: isize) -> Result<Self, Win32Error> {
+        if raw == 0 {
+            Err(Win32Error::NullWindowHandle)
+        } else {
+            Ok(Self(raw))
+        }
+    }
+
+    pub fn raw(self) -> isize {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlatformCapabilities {
@@ -52,12 +66,20 @@ mod tests {
     #[test]
     fn require_hwnd_rejects_null_handle() {
         assert_eq!(
-            require_hwnd(NativeWindowHandle(0)),
+            NativeWindowHandle::new(0),
             Err(Win32Error::NullWindowHandle)
         );
-        assert_eq!(
-            require_hwnd(NativeWindowHandle(42)),
-            Ok(NativeWindowHandle(42))
-        );
+
+        let handle = NativeWindowHandle::new(42).expect("non-null handle");
+
+        assert_eq!(handle.raw(), 42);
+        assert_eq!(require_hwnd(handle), Ok(handle));
+    }
+
+    #[test]
+    fn require_hwnd_preserves_checked_handle() {
+        let handle = NativeWindowHandle::new(42).expect("non-null handle");
+
+        assert_eq!(require_hwnd(handle).map(NativeWindowHandle::raw), Ok(42));
     }
 }

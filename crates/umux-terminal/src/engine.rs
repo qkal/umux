@@ -7,6 +7,8 @@ use umux_notify::{TerminalNotification, parse_osc_notifications};
 pub struct TerminalSurface {
     cwd: String,
     scrollback: String,
+    #[serde(default)]
+    pending_output: String,
 }
 
 impl TerminalSurface {
@@ -14,6 +16,7 @@ impl TerminalSurface {
         Self {
             cwd: cwd.into(),
             scrollback: String::new(),
+            pending_output: String::new(),
         }
     }
 
@@ -27,6 +30,37 @@ impl TerminalSurface {
 
     pub fn feed_output(&mut self, output: &str) -> Vec<TerminalNotification> {
         self.scrollback.push_str(output);
-        parse_osc_notifications(output)
+
+        let buffered_output = if self.pending_output.is_empty() {
+            output.to_owned()
+        } else {
+            let mut buffered_output =
+                String::with_capacity(self.pending_output.len() + output.len());
+            buffered_output.push_str(&self.pending_output);
+            buffered_output.push_str(output);
+            buffered_output
+        };
+
+        self.pending_output = trailing_incomplete_osc(&buffered_output)
+            .map(str::to_owned)
+            .unwrap_or_default();
+
+        parse_osc_notifications(&buffered_output)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending_output.len()
+    }
+}
+
+fn trailing_incomplete_osc(output: &str) -> Option<&str> {
+    let osc_start = output.rfind("\u{1b}]")?;
+    let trailing = &output[osc_start..];
+
+    if trailing.contains('\u{7}') || trailing.contains("\u{1b}\\") {
+        None
+    } else {
+        Some(trailing)
     }
 }
