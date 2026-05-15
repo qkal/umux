@@ -3450,8 +3450,10 @@ dependencies = [
 name = "umux-ui"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "floem",
  "umux-core",
+ "umux-terminal",
 ]
 
 [[package]]

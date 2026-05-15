@@ -5,6 +5,7 @@ use std::env;
 use floem::prelude::*;
 use umux_core::AppModel;
 
+use crate::terminal_view::terminal_view;
 use crate::theme::{SIDEBAR_WIDTH, SURFACE_TAB_HEIGHT, TOP_BAR_HEIGHT};
 
 const BACKGROUND: Color = Color::rgb8(0x11, 0x13, 0x16);
@@ -102,11 +103,7 @@ fn work_area(surface_count: usize) -> impl IntoView {
                 .border_bottom(1.0)
                 .border_color(Color::rgb8(0x25, 0x2a, 0x32))
         }),
-        v_stack((
-            label(|| "Terminal surface").style(|s| s.color(TEXT).font_size(16.0)),
-            label(|| "Surface placeholder").style(|s| s.color(MUTED_TEXT).font_size(12.0)),
-        ))
-        .style(|s| {
+        terminal_view().style(|s| {
             s.width_full()
                 .height_full()
                 .padding(16.0)
