@@ -18,6 +18,11 @@ pub fn parse_osc_notifications(input: &str) -> Vec<TerminalNotification> {
             break;
         };
 
+        if let Some(nested_start) = input[body_start..body_start + body_end].find(OSC_START) {
+            cursor = body_start + nested_start;
+            continue;
+        }
+
         let body = &input[body_start..body_start + body_end];
         if let Some(notification) = parse_osc_body(body) {
             notifications.push(notification);
@@ -103,5 +108,28 @@ mod tests {
         let notifications = parse_osc_notifications("\u{1b}]0;window title\u{7}");
 
         assert!(notifications.is_empty());
+    }
+
+    #[test]
+    fn resyncs_when_new_osc_starts_before_terminator() {
+        let notifications = parse_osc_notifications("\u{1b}]0;bad\u{1b}]9;ready\u{7}");
+
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].kind, OscNotificationKind::Osc9);
+        assert_eq!(notifications[0].message, "ready");
+    }
+
+    #[test]
+    fn parses_multiple_notifications_and_preserves_utf8_payloads() {
+        let notifications = parse_osc_notifications(
+            "\u{1b}]9;build ✓\u{7}middle\u{1b}]777;notify;Codex;Zażółć gęślą\u{1b}\\",
+        );
+
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0].kind, OscNotificationKind::Osc9);
+        assert_eq!(notifications[0].message, "build ✓");
+        assert_eq!(notifications[1].kind, OscNotificationKind::Osc777);
+        assert_eq!(notifications[1].title.as_deref(), Some("Codex"));
+        assert_eq!(notifications[1].message, "Zażółć gęślą");
     }
 }
