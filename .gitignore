@@ -1,0 +1,11 @@
+/target/
+**/*.rs.bk
+.idea/
+.vscode/
+*.pdb
+*.ilk
+*.exe
+*.msix
+*.appx
+*.zip
+/.cargo/.package-cache/
