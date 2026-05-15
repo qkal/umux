@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod appearance;
+pub mod clipboard;
 pub mod engine;
+pub mod events;
+pub mod input;
 pub mod shell;
 pub mod snapshot;
 pub mod startup_env;
@@ -9,7 +12,10 @@ pub mod startup_env;
 pub use appearance::{
     TerminalAppearance, TerminalColor, TerminalGridSize, TerminalMetrics, TerminalPalette,
 };
+pub use clipboard::{ClipboardError, ClipboardPort, FakeClipboard};
 pub use engine::TerminalSurface;
+pub use events::{TerminalEvent, TerminalHealth, TerminalStatus};
+pub use input::{TerminalInputRoute, TerminalInputRouter, TerminalKey, TerminalKeyEvent};
 pub use shell::{ResolvedShell, ShellResolver};
 pub use snapshot::{TerminalCell, TerminalCursor, TerminalRendererSnapshot, TerminalSelection};
 pub use startup_env::StartupEnvironment;
