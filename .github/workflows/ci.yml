@@ -15,8 +15,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Format
+        if: ${{ hashFiles('Cargo.toml') != '' }}
         run: cargo fmt --check
       - name: Clippy
+        if: ${{ hashFiles('Cargo.toml') != '' }}
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
+        if: ${{ hashFiles('Cargo.toml') != '' }}
         run: cargo test --all
