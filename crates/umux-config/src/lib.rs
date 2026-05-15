@@ -6,4 +6,4 @@ pub mod paths;
 pub mod shortcuts;
 
 pub use paths::default_config_dir;
-pub use shortcuts::{ShortcutBinding, default_shortcuts};
+pub use shortcuts::{ShortcutBinding, ShortcutContext, WindowsBinding, default_shortcuts};
