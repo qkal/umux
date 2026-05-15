@@ -1,5 +1,6 @@
 /target/
 /cmux/
+/docs/
 **/*.rs.bk
 .idea/
 .vscode/
