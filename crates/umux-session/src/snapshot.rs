@@ -43,15 +43,22 @@ impl AppSnapshot {
     }
 
     pub fn from_json_str(json: &str) -> Result<Self, SessionError> {
-        let snapshot: Self = serde_json::from_str(json)?;
-        if snapshot.schema_version != SCHEMA_VERSION {
+        let envelope: SnapshotEnvelope = serde_json::from_str(json)?;
+        if envelope.schema_version != SCHEMA_VERSION {
             return Err(SessionError::UnsupportedSchemaVersion(
-                snapshot.schema_version,
+                envelope.schema_version,
             ));
         }
 
+        let snapshot: Self = serde_json::from_str(json)?;
+
         Ok(snapshot)
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+struct SnapshotEnvelope {
+    schema_version: u32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -294,6 +301,18 @@ mod tests {
     #[test]
     fn unsupported_schema_version_is_rejected() {
         let json = r#"{"schema_version":2,"selected_window":1,"windows":[]}"#;
+
+        let result = AppSnapshot::from_json_str(json);
+
+        assert!(matches!(
+            result,
+            Err(SessionError::UnsupportedSchemaVersion(2))
+        ));
+    }
+
+    #[test]
+    fn unsupported_schema_version_is_rejected_before_body_deserialization() {
+        let json = r#"{"schema_version":2,"future_shape":{"anything":true}}"#;
 
         let result = AppSnapshot::from_json_str(json);
 
