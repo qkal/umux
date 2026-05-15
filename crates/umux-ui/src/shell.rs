@@ -5,7 +5,7 @@ use std::env;
 use floem::prelude::*;
 use umux_core::AppModel;
 
-use crate::terminal_view::terminal_view;
+use crate::terminal_view::terminal_view_for_cwd;
 use crate::theme::{SIDEBAR_WIDTH, SURFACE_TAB_HEIGHT, TOP_BAR_HEIGHT};
 
 const BACKGROUND: Color = Color::rgb8(0x11, 0x13, 0x16);
@@ -40,10 +40,13 @@ fn shell_view(model: AppModel) -> impl IntoView {
         .selected_pane()
         .map(|pane| pane.surfaces.len())
         .unwrap_or_default();
+    let cwd = workspace
+        .map(|workspace| workspace.cwd.clone())
+        .unwrap_or_else(|| ".".to_string());
 
     v_stack((
         top_bar(workspace_title.clone()),
-        h_stack((sidebar(workspace_title), work_area(surface_count)))
+        h_stack((sidebar(workspace_title), work_area(surface_count, cwd)))
             .style(|s| s.flex().width_full().height_full()),
     ))
     .style(|s| s.size_full().background(BACKGROUND).color(TEXT))
@@ -84,7 +87,7 @@ fn sidebar(workspace_title: String) -> impl IntoView {
     })
 }
 
-fn work_area(surface_count: usize) -> impl IntoView {
+fn work_area(surface_count: usize, cwd: String) -> impl IntoView {
     let surface_count_label = format!("{surface_count} surface");
 
     v_stack((
@@ -103,7 +106,7 @@ fn work_area(surface_count: usize) -> impl IntoView {
                 .border_bottom(1.0)
                 .border_color(Color::rgb8(0x25, 0x2a, 0x32))
         }),
-        terminal_view().style(|s| {
+        terminal_view_for_cwd(cwd).style(|s| {
             s.width_full()
                 .height_full()
                 .padding(16.0)

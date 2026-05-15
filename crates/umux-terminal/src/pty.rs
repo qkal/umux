@@ -44,7 +44,7 @@ pub trait PtyBackend {
 
 const MAX_PTY_DIMENSION: u16 = i16::MAX as u16;
 
-fn clamp_pty_size(cols: u16, rows: u16) -> (u16, u16) {
+pub(crate) fn clamp_pty_size(cols: u16, rows: u16) -> (u16, u16) {
     (
         cols.clamp(1, MAX_PTY_DIMENSION),
         rows.clamp(1, MAX_PTY_DIMENSION),
@@ -108,6 +108,12 @@ pub struct AlacrittyPtyBackend {
 #[cfg(windows)]
 impl AlacrittyPtyBackend {
     pub fn spawn(config: PtySpawnConfig) -> Result<Self, PtyError> {
+        let pty = Self::spawn_raw(config)?;
+
+        Ok(Self { pty })
+    }
+
+    pub fn spawn_raw(config: PtySpawnConfig) -> Result<tty::Pty, PtyError> {
         let (cols, rows) = clamp_pty_size(config.cols, config.rows);
         let options = Options {
             shell: Some(Shell::new(config.shell.program, config.shell.args)),
@@ -122,9 +128,8 @@ impl AlacrittyPtyBackend {
             cell_width: 0,
             cell_height: 0,
         };
-        let pty = tty::new(&options, window_size, 0).map_err(io_error)?;
 
-        Ok(Self { pty })
+        tty::new(&options, window_size, 0).map_err(io_error)
     }
 }
 

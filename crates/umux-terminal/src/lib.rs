@@ -7,6 +7,7 @@ pub mod emulator;
 pub mod engine;
 pub mod events;
 pub mod input;
+pub mod live;
 pub mod pty;
 pub mod session;
 pub mod shell;
@@ -22,6 +23,8 @@ pub use emulator::{TerminalEmulator, TerminalEventSink};
 pub use engine::TerminalSurface;
 pub use events::{TerminalEvent, TerminalHealth, TerminalStatus};
 pub use input::{TerminalInputRoute, TerminalInputRouter, TerminalKey, TerminalKeyEvent};
+#[cfg(windows)]
+pub use live::LiveTerminalSession;
 #[cfg(windows)]
 pub use pty::AlacrittyPtyBackend;
 pub use pty::{FakePtyBackend, PtyBackend, PtyError, PtySpawnConfig};
