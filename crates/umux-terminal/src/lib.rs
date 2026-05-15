@@ -2,6 +2,7 @@
 
 pub mod appearance;
 pub mod clipboard;
+pub mod emulator;
 pub mod engine;
 pub mod events;
 pub mod input;
@@ -13,6 +14,7 @@ pub use appearance::{
     TerminalAppearance, TerminalColor, TerminalGridSize, TerminalMetrics, TerminalPalette,
 };
 pub use clipboard::{ClipboardError, ClipboardPort, FakeClipboard};
+pub use emulator::{TerminalEmulator, TerminalEventSink};
 pub use engine::TerminalSurface;
 pub use events::{TerminalEvent, TerminalHealth, TerminalStatus};
 pub use input::{TerminalInputRoute, TerminalInputRouter, TerminalKey, TerminalKeyEvent};
