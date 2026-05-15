@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod appearance;
 pub mod engine;
 pub mod shell;
+pub mod snapshot;
 pub mod startup_env;
 
+pub use appearance::{
+    TerminalAppearance, TerminalColor, TerminalGridSize, TerminalMetrics, TerminalPalette,
+};
 pub use engine::TerminalSurface;
 pub use shell::{ResolvedShell, ShellResolver};
+pub use snapshot::{TerminalCell, TerminalCursor, TerminalRendererSnapshot, TerminalSelection};
 pub use startup_env::StartupEnvironment;
 
 pub const CRATE_NAME: &str = "umux-terminal";
