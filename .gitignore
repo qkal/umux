@@ -1,4 +1,6 @@
 /target/
+/.worktrees
+/.worktrees/
 /cmux/
 /docs/
 **/*.rs.bk
