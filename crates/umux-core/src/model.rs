@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -24,29 +22,9 @@ pub enum SplitTree {
     Leaf(PaneId),
     Split {
         axis: SplitAxis,
-        first: Box<SplitTree>,
-        second: Box<SplitTree>,
+        first: PaneId,
+        second: PaneId,
     },
-}
-
-impl SplitTree {
-    fn split_leaf(&mut self, target: PaneId, axis: SplitAxis, new_pane: PaneId) -> bool {
-        match self {
-            SplitTree::Leaf(pane_id) if *pane_id == target => {
-                *self = SplitTree::Split {
-                    axis,
-                    first: Box::new(SplitTree::Leaf(target)),
-                    second: Box::new(SplitTree::Leaf(new_pane)),
-                };
-                true
-            }
-            SplitTree::Leaf(_) => false,
-            SplitTree::Split { first, second, .. } => {
-                first.split_leaf(target, axis, new_pane)
-                    || second.split_leaf(target, axis, new_pane)
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -60,7 +38,7 @@ pub struct Surface {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Pane {
     pub id: PaneId,
-    pub cwd: PathBuf,
+    pub cwd: String,
     pub surfaces: Vec<Surface>,
     pub selected_surface: SurfaceId,
 }
@@ -79,7 +57,7 @@ impl Pane {
 pub struct Workspace {
     pub id: WorkspaceId,
     pub title: String,
-    pub cwd: PathBuf,
+    pub cwd: String,
     pub panes: Vec<Pane>,
     pub selected_pane: PaneId,
     pub layout: SplitTree,
@@ -132,21 +110,21 @@ impl AppWindow {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppModel {
-    #[serde(skip)]
     pub ids: IdGen,
     pub windows: Vec<AppWindow>,
     pub selected_window: WindowId,
 }
 
 impl AppModel {
-    pub fn new(cwd: PathBuf) -> Self {
+    pub fn new(cwd: impl Into<String>) -> Self {
+        let cwd = cwd.into();
         let mut ids = IdGen::new();
-        let window_id = ids.window_id();
-        let workspace_id = ids.workspace_id();
-        let pane_id = ids.pane_id();
-        let surface_id = ids.surface_id();
+        let window_id = ids.next_window();
+        let workspace_id = ids.next_workspace();
+        let pane_id = ids.next_pane();
+        let surface_id = ids.next_surface();
         let title = workspace_title(&cwd);
 
         let surface = terminal_surface(surface_id);
@@ -225,8 +203,8 @@ impl AppModel {
             .ok_or(ModelError::UnknownPane(selected_pane_id))?
             .cwd
             .clone();
-        let new_pane_id = self.ids.pane_id();
-        let surface_id = self.ids.surface_id();
+        let new_pane_id = self.ids.next_pane();
+        let surface_id = self.ids.next_surface();
         let new_pane = Pane {
             id: new_pane_id,
             cwd,
@@ -236,16 +214,18 @@ impl AppModel {
 
         let workspace = self.selected_workspace_mut()?;
         workspace.panes.push(new_pane);
-        workspace
-            .layout
-            .split_leaf(selected_pane_id, axis, new_pane_id);
+        workspace.layout = SplitTree::Split {
+            axis,
+            first: selected_pane_id,
+            second: new_pane_id,
+        };
         workspace.selected_pane = new_pane_id;
 
         Ok(new_pane_id)
     }
 
     pub fn open_browser_surface(&mut self, url: String) -> Result<SurfaceId, ModelError> {
-        let surface_id = self.ids.surface_id();
+        let surface_id = self.ids.next_surface();
         let surface = Surface {
             id: surface_id,
             kind: SurfaceKind::Browser,
@@ -295,10 +275,9 @@ pub enum ModelError {
     UnknownSurface(SurfaceId),
 }
 
-fn workspace_title(cwd: &std::path::Path) -> String {
-    cwd.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
+fn workspace_title(cwd: &str) -> String {
+    cwd.rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
         .unwrap_or("Workspace")
         .to_string()
 }
@@ -314,14 +293,27 @@ fn terminal_surface(id: SurfaceId) -> Surface {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use super::{AppModel, SplitAxis, SplitTree, SurfaceKind};
+    use crate::ids::{PaneId, SurfaceId, WindowId, WorkspaceId};
 
-    use super::{AppModel, SplitAxis, SurfaceKind};
+    #[test]
+    fn id_gen_returns_incrementing_ids_starting_at_one() {
+        let app = AppModel::new("C:/work/project");
+
+        assert_eq!(app.selected_window, WindowId(1));
+        let workspace = app.selected_workspace().unwrap();
+        assert_eq!(workspace.id, WorkspaceId(2));
+        assert_eq!(workspace.selected_pane, PaneId(3));
+        assert_eq!(
+            workspace.selected_pane().unwrap().selected_surface,
+            SurfaceId(4)
+        );
+    }
 
     #[test]
     fn new_app_has_one_workspace_one_pane_and_one_terminal_surface() {
-        let cwd = PathBuf::from("C:/Users/Better/projects/alpha");
-        let app = AppModel::new(cwd.clone());
+        let cwd = "C:/Users/Better/projects/alpha";
+        let app = AppModel::new(cwd);
 
         assert_eq!(app.windows.len(), 1);
         assert_eq!(app.selected_window, app.windows[0].id);
@@ -351,14 +343,23 @@ mod tests {
 
     #[test]
     fn split_selected_pane_creates_second_pane_with_inherited_cwd() {
-        let cwd = PathBuf::from("C:/work/project");
-        let mut app = AppModel::new(cwd.clone());
+        let cwd = "C:/work/project";
+        let mut app = AppModel::new(cwd);
+        let first_pane_id = app.selected_pane().unwrap().id;
 
         let new_pane_id = app.split_selected_pane(SplitAxis::Vertical).unwrap();
 
         let workspace = app.selected_workspace().unwrap();
         assert_eq!(workspace.panes.len(), 2);
         assert_eq!(workspace.selected_pane, new_pane_id);
+        assert_eq!(
+            workspace.layout,
+            SplitTree::Split {
+                axis: SplitAxis::Vertical,
+                first: first_pane_id,
+                second: new_pane_id,
+            }
+        );
 
         let new_pane = workspace.pane(new_pane_id).unwrap();
         assert_eq!(new_pane.cwd, cwd);
@@ -371,7 +372,7 @@ mod tests {
 
     #[test]
     fn browser_surface_is_created_in_selected_pane() {
-        let mut app = AppModel::new(PathBuf::from("C:/work/project"));
+        let mut app = AppModel::new("C:/work/project");
 
         let surface_id = app
             .open_browser_surface("https://example.com".to_string())
@@ -389,7 +390,7 @@ mod tests {
 
     #[test]
     fn unread_state_rolls_up_from_surface_to_workspace() {
-        let mut app = AppModel::new(PathBuf::from("C:/work/project"));
+        let mut app = AppModel::new("C:/work/project");
         let surface_id = app.selected_pane().unwrap().selected_surface;
 
         app.mark_surface_unread(surface_id, "Build finished".to_string())

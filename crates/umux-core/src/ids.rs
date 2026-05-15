@@ -26,25 +26,24 @@ impl IdGen {
         Self::default()
     }
 
-    pub fn window_id(&mut self) -> WindowId {
+    pub fn next_window(&mut self) -> WindowId {
         WindowId(self.next())
     }
 
-    pub fn workspace_id(&mut self) -> WorkspaceId {
+    pub fn next_workspace(&mut self) -> WorkspaceId {
         WorkspaceId(self.next())
     }
 
-    pub fn pane_id(&mut self) -> PaneId {
+    pub fn next_pane(&mut self) -> PaneId {
         PaneId(self.next())
     }
 
-    pub fn surface_id(&mut self) -> SurfaceId {
+    pub fn next_surface(&mut self) -> SurfaceId {
         SurfaceId(self.next())
     }
 
     fn next(&mut self) -> u64 {
-        let id = self.next_id;
         self.next_id += 1;
-        id
+        self.next_id
     }
 }
