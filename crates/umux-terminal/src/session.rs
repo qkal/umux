@@ -49,9 +49,8 @@ impl<B: PtyBackend> TerminalSession<B> {
     }
 
     pub fn pump_once(&mut self) -> Result<(), PtyError> {
-        let output = self.backend.read_output().map_err(|error| {
-            self.record_error(&error);
-            error
+        let output = self.backend.read_output().inspect_err(|error| {
+            self.record_error(error);
         })?;
         if output.is_empty() {
             return Ok(());
@@ -69,9 +68,8 @@ impl<B: PtyBackend> TerminalSession<B> {
 
     pub fn write_input(&mut self, input: impl AsRef<[u8]>) -> Result<(), PtyError> {
         let input = input.as_ref();
-        self.backend.write_input(input).map_err(|error| {
-            self.record_error(&error);
-            error
+        self.backend.write_input(input).inspect_err(|error| {
+            self.record_error(error);
         })?;
         self.health.bytes_written = self
             .health
@@ -87,9 +85,8 @@ impl<B: PtyBackend> TerminalSession<B> {
             return Ok(());
         }
 
-        self.backend.resize(cols, rows).map_err(|error| {
-            self.record_error(&error);
-            error
+        self.backend.resize(cols, rows).inspect_err(|error| {
+            self.record_error(error);
         })?;
         self.emulator.resize(cols, rows);
         self.health.cols = cols;
