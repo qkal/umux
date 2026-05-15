@@ -196,9 +196,13 @@ impl AppModel {
     }
 
     pub fn split_selected_pane(&mut self, axis: SplitAxis) -> Result<PaneId, ModelError> {
-        let selected_pane_id = self.selected_workspace()?.selected_pane;
-        let cwd = self
-            .selected_workspace()?
+        let workspace = self.selected_workspace()?;
+        if matches!(workspace.layout, SplitTree::Split { .. }) {
+            return Err(ModelError::LayoutAlreadySplit);
+        }
+
+        let selected_pane_id = workspace.selected_pane;
+        let cwd = workspace
             .pane(selected_pane_id)
             .ok_or(ModelError::UnknownPane(selected_pane_id))?
             .cwd
@@ -269,6 +273,8 @@ pub enum ModelError {
     NoSelectedWorkspace,
     #[error("no selected pane")]
     NoSelectedPane,
+    #[error("layout is already split")]
+    LayoutAlreadySplit,
     #[error("unknown pane {0:?}")]
     UnknownPane(PaneId),
     #[error("unknown surface {0:?}")]
@@ -293,7 +299,7 @@ fn terminal_surface(id: SurfaceId) -> Surface {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppModel, SplitAxis, SplitTree, SurfaceKind};
+    use super::{AppModel, ModelError, SplitAxis, SplitTree, SurfaceKind};
     use crate::ids::{PaneId, SurfaceId, WindowId, WorkspaceId};
 
     #[test]
@@ -368,6 +374,24 @@ mod tests {
             new_pane.surface(new_pane.selected_surface).unwrap().kind,
             SurfaceKind::Terminal
         );
+    }
+
+    #[test]
+    fn second_split_is_rejected_without_changing_panes_or_layout() {
+        let mut app = AppModel::new("C:/work/project");
+        app.split_selected_pane(SplitAxis::Vertical).unwrap();
+        let workspace = app.selected_workspace().unwrap();
+        let pane_count = workspace.panes.len();
+        let selected_pane = workspace.selected_pane;
+        let layout = workspace.layout.clone();
+
+        let result = app.split_selected_pane(SplitAxis::Horizontal);
+
+        assert_eq!(result, Err(ModelError::LayoutAlreadySplit));
+        let workspace = app.selected_workspace().unwrap();
+        assert_eq!(workspace.panes.len(), pane_count);
+        assert_eq!(workspace.selected_pane, selected_pane);
+        assert_eq!(workspace.layout, layout);
     }
 
     #[test]
