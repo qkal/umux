@@ -7,6 +7,7 @@ pub mod engine;
 pub mod events;
 pub mod input;
 pub mod pty;
+pub mod session;
 pub mod shell;
 pub mod snapshot;
 pub mod startup_env;
@@ -22,6 +23,7 @@ pub use input::{TerminalInputRoute, TerminalInputRouter, TerminalKey, TerminalKe
 #[cfg(windows)]
 pub use pty::AlacrittyPtyBackend;
 pub use pty::{FakePtyBackend, PtyBackend, PtyError, PtySpawnConfig};
+pub use session::{TerminalSession, TerminalSessionConfig};
 pub use shell::{ResolvedShell, ShellResolver};
 pub use snapshot::{TerminalCell, TerminalCursor, TerminalRendererSnapshot, TerminalSelection};
 pub use startup_env::StartupEnvironment;
