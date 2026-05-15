@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod engine;
+pub mod shell;
+pub mod startup_env;
 
 pub use engine::TerminalSurface;
+pub use shell::{ResolvedShell, ShellResolver};
+pub use startup_env::StartupEnvironment;
 
 pub const CRATE_NAME: &str = "umux-terminal";
 
