@@ -43,6 +43,7 @@ fn surface_tab_label(surface: &umux_core::model::Surface) -> String {
 }
 
 pub fn run() {
+    crate::diagnostics::init_diagnostics();
     floem::launch(app_view);
 }
 

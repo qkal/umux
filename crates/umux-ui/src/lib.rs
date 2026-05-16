@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub(crate) mod diagnostics;
 pub mod shell;
 pub(crate) mod terminal_canvas;
 pub mod terminal_view;
