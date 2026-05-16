@@ -140,14 +140,15 @@ impl AppController {
             .flat_map(|window| window.workspaces.iter())
             .flat_map(|workspace| {
                 workspace.panes.iter().flat_map(move |pane| {
-                    pane.surfaces.iter().filter_map(move |surface| {
-                        (surface.kind == SurfaceKind::Terminal).then(|| TerminalSpawnSpec {
+                    pane.surfaces
+                        .iter()
+                        .filter(|surface| surface.kind == SurfaceKind::Terminal)
+                        .map(move |surface| TerminalSpawnSpec {
                             workspace_id: workspace.id,
                             pane_id: pane.id,
                             surface_id: surface.id,
                             cwd: pane.cwd.clone(),
                         })
-                    })
                 })
             })
             .collect()
@@ -330,5 +331,19 @@ mod tests {
         assert!(!controller.terminals.contains(closed));
         assert!(controller.terminals.contains(replacement));
         assert_eq!(controller.terminals.len(), 1);
+    }
+
+    #[test]
+    fn successful_actions_request_session_save() {
+        let mut controller = AppController::new(AppModel::new("C:/work/alpha")).unwrap();
+        let selected_workspace = controller.model.selected_workspace().unwrap().id;
+
+        let save_now = controller.apply(AppAction::SaveSessionNow).unwrap();
+        let select_workspace = controller
+            .apply(AppAction::SelectWorkspace(selected_workspace))
+            .unwrap();
+
+        assert!(save_now.should_save_session);
+        assert!(select_workspace.should_save_session);
     }
 }
