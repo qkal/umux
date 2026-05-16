@@ -48,13 +48,20 @@ impl SessionStore {
     }
 
     pub fn load_model(&self) -> Result<Option<AppModel>, SessionStoreError> {
-        let json = match fs::read_to_string(&self.path) {
-            Ok(json) => json,
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        let json = match std::str::from_utf8(&bytes) {
+            Ok(json) => json,
+            Err(_) => {
+                self.rename_corrupt_file()?;
+                return Ok(None);
+            }
+        };
 
-        match AppSnapshot::from_json_str(&json).and_then(AppSnapshot::into_model) {
+        match AppSnapshot::from_json_str(json).and_then(AppSnapshot::into_model) {
             Ok(model) => Ok(Some(model)),
             Err(_) => {
                 self.rename_corrupt_file()?;
@@ -136,6 +143,27 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let session_path = dir.join("session.json");
         fs::write(&session_path, "{not json").unwrap();
+        let store = SessionStore::new(session_path.clone());
+
+        let loaded = store.load_model().unwrap();
+
+        assert_eq!(loaded, None);
+        assert!(!session_path.exists());
+        assert!(fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("session.json.corrupt.")
+        }));
+    }
+
+    #[test]
+    fn invalid_utf8_session_is_renamed_aside() {
+        let dir = temp_session_path("invalid-utf8");
+        fs::create_dir_all(&dir).unwrap();
+        let session_path = dir.join("session.json");
+        fs::write(&session_path, [0xff, 0xfe, 0xfd]).unwrap();
         let store = SessionStore::new(session_path.clone());
 
         let loaded = store.load_model().unwrap();
