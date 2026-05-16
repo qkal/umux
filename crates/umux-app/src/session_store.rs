@@ -20,6 +20,13 @@ pub enum SessionStoreError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionLoadOutcome {
+    Missing,
+    Loaded(AppModel),
+    RecoveredCorrupt { corrupt_path: Utf8PathBuf },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionStore {
     path: Utf8PathBuf,
 }
@@ -60,29 +67,38 @@ impl SessionStore {
     }
 
     pub fn load_model(&self) -> Result<Option<AppModel>, SessionStoreError> {
+        match self.load_model_with_status()? {
+            SessionLoadOutcome::Loaded(model) => Ok(Some(model)),
+            SessionLoadOutcome::Missing | SessionLoadOutcome::RecoveredCorrupt { .. } => Ok(None),
+        }
+    }
+
+    pub fn load_model_with_status(&self) -> Result<SessionLoadOutcome, SessionStoreError> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(SessionLoadOutcome::Missing);
+            }
             Err(error) => return Err(error.into()),
         };
         let json = match std::str::from_utf8(&bytes) {
             Ok(json) => json,
             Err(_) => {
-                self.rename_corrupt_file()?;
-                return Ok(None);
+                let corrupt_path = self.rename_corrupt_file()?;
+                return Ok(SessionLoadOutcome::RecoveredCorrupt { corrupt_path });
             }
         };
 
         match AppSnapshot::from_json_str(json).and_then(AppSnapshot::into_model) {
-            Ok(model) => Ok(Some(model)),
+            Ok(model) => Ok(SessionLoadOutcome::Loaded(model)),
             Err(_) => {
-                self.rename_corrupt_file()?;
-                Ok(None)
+                let corrupt_path = self.rename_corrupt_file()?;
+                Ok(SessionLoadOutcome::RecoveredCorrupt { corrupt_path })
             }
         }
     }
 
-    fn rename_corrupt_file(&self) -> Result<(), std::io::Error> {
+    fn rename_corrupt_file(&self) -> Result<Utf8PathBuf, std::io::Error> {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -98,7 +114,8 @@ impl SessionStore {
             };
             let candidate = sibling_path(&self.path, &candidate_name);
             if !candidate.exists() {
-                return fs::rename(&self.path, candidate);
+                fs::rename(&self.path, &candidate)?;
+                return Ok(candidate);
             }
         }
 
@@ -182,7 +199,7 @@ mod tests {
     use camino::Utf8PathBuf;
     use umux_core::AppModel;
 
-    use super::{SessionStore, temp_save_path};
+    use super::{SessionLoadOutcome, SessionStore, temp_save_path};
 
     #[test]
     fn save_and_load_round_trip_model() {
@@ -246,6 +263,17 @@ mod tests {
     }
 
     #[test]
+    fn load_model_with_status_reports_missing_session() {
+        let session_path = temp_session_path("missing-status").join("session.json");
+        let store = SessionStore::new(session_path);
+
+        assert_eq!(
+            store.load_model_with_status().unwrap(),
+            SessionLoadOutcome::Missing
+        );
+    }
+
+    #[test]
     fn corrupt_session_is_renamed_aside() {
         let dir = temp_session_path("corrupt");
         fs::create_dir_all(&dir).unwrap();
@@ -264,6 +292,29 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("session.json.corrupt.")
         }));
+    }
+
+    #[test]
+    fn load_model_with_status_reports_recovered_corrupt_session() {
+        let dir = temp_session_path("corrupt-status");
+        fs::create_dir_all(&dir).unwrap();
+        let session_path = dir.join("session.json");
+        fs::write(&session_path, "{not json").unwrap();
+        let store = SessionStore::new(session_path.clone());
+
+        let outcome = store.load_model_with_status().unwrap();
+
+        let SessionLoadOutcome::RecoveredCorrupt { corrupt_path } = outcome else {
+            panic!("expected recovered corrupt outcome");
+        };
+        assert!(!session_path.exists());
+        assert!(corrupt_path.exists());
+        assert!(
+            corrupt_path
+                .file_name()
+                .unwrap()
+                .starts_with("session.json.corrupt.")
+        );
     }
 
     #[test]
