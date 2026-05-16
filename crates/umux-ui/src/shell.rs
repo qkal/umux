@@ -9,7 +9,11 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 use floem::style::Style;
-use umux_app::{AppAction, AppController, SessionStore, TerminalEntry};
+use tracing::{info, warn};
+use umux_app::session_store::SessionLoadOutcome;
+use umux_app::{
+    AppAction, AppController, AppControllerError, SessionStore, SessionStoreError, TerminalEntry,
+};
 use umux_core::AppModel;
 use umux_core::model::{SplitTree, Workspace};
 use umux_core::{PaneId, SplitAxis, SurfaceId, SurfaceKind, WorkspaceId};
@@ -25,6 +29,11 @@ const PANEL: Color = Color::rgb8(0x18, 0x1b, 0x20);
 const TEXT: Color = Color::rgb8(0xe7, 0xea, 0xf0);
 const MUTED_TEXT: Color = Color::rgb8(0x9b, 0xa3, 0xaf);
 const UNREAD_BLUE: Color = Color::rgb8(0x2f, 0x80, 0xff);
+const RECOVERED_SESSION_WARNING: &str =
+    "Previous session could not be restored. A recovered copy was moved aside.";
+const SESSION_READ_WARNING: &str = "Session file could not be read. Opened a fresh workspace.";
+const RESTORE_CONTROLLER_WARNING: &str =
+    "Previous session could not be restored. Opened a fresh workspace.";
 
 fn workspace_row_label(workspace: &umux_core::model::Workspace) -> String {
     if workspace.unread {
@@ -58,20 +67,115 @@ fn current_dir_cwd() -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
-fn app_view() -> impl IntoView {
-    let store = SessionStore::new(SessionStore::default_path());
-    let model = store.load_model().ok().flatten().unwrap_or_else(seed_model);
-    let controller = AppController::from_restored_model(model).unwrap_or_else(|_| {
-        AppController::new(seed_model()).expect("seed model should create an app controller")
-    });
-
-    shell_view(controller, store)
+#[derive(Clone)]
+struct StartupState {
+    controller: AppController,
+    warning: Option<StartupWarning>,
 }
 
-fn shell_view(controller: AppController, store: SessionStore) -> impl IntoView {
-    let shared_model = Arc::new(Mutex::new(controller.model.clone()));
-    let controller = create_rw_signal(controller);
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StartupWarning {
+    message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StartupLoadDecision {
+    model: AppModel,
+    restored: bool,
+    warning: Option<StartupWarning>,
+}
+
+fn startup_load_decision(
+    load_result: Result<SessionLoadOutcome, SessionStoreError>,
+    fallback_cwd: String,
+) -> StartupLoadDecision {
+    match load_result {
+        Ok(SessionLoadOutcome::Missing) => {
+            info!(%fallback_cwd, "no saved session found; starting fresh workspace");
+            StartupLoadDecision {
+                model: AppModel::new(fallback_cwd),
+                restored: false,
+                warning: None,
+            }
+        }
+        Ok(SessionLoadOutcome::Loaded(model)) => {
+            info!("saved session loaded");
+            StartupLoadDecision {
+                model,
+                restored: true,
+                warning: None,
+            }
+        }
+        Ok(SessionLoadOutcome::RecoveredCorrupt { corrupt_path }) => {
+            warn!(%corrupt_path, "corrupt saved session recovered");
+            StartupLoadDecision {
+                model: AppModel::new(fallback_cwd),
+                restored: false,
+                warning: Some(StartupWarning {
+                    message: RECOVERED_SESSION_WARNING.to_string(),
+                }),
+            }
+        }
+        Err(error) => {
+            warn!(%error, "saved session could not be read");
+            StartupLoadDecision {
+                model: AppModel::new(fallback_cwd),
+                restored: false,
+                warning: Some(StartupWarning {
+                    message: SESSION_READ_WARNING.to_string(),
+                }),
+            }
+        }
+    }
+}
+
+fn startup_state_from_store(store: &SessionStore) -> StartupState {
+    startup_state_from_decision(startup_load_decision(
+        store.load_model_with_status(),
+        current_dir_cwd(),
+    ))
+}
+
+fn startup_state_from_decision(decision: StartupLoadDecision) -> StartupState {
+    match AppController::from_restored_model(decision.model) {
+        Ok(controller) => {
+            if decision.restored {
+                info!("restored saved session controller");
+            } else {
+                info!("started fresh workspace controller");
+            }
+            StartupState {
+                controller,
+                warning: decision.warning,
+            }
+        }
+        Err(error) => fresh_startup_after_restore_error(error),
+    }
+}
+
+fn fresh_startup_after_restore_error(error: AppControllerError) -> StartupState {
+    warn!(%error, "restored session could not initialize controller");
+    StartupState {
+        controller: AppController::new(seed_model())
+            .expect("seed model should create an app controller"),
+        warning: Some(StartupWarning {
+            message: RESTORE_CONTROLLER_WARNING.to_string(),
+        }),
+    }
+}
+
+fn app_view() -> impl IntoView {
+    let store = SessionStore::new(SessionStore::default_path());
+    let startup = startup_state_from_store(&store);
+
+    shell_view(startup, store)
+}
+
+fn shell_view(startup: StartupState, store: SessionStore) -> impl IntoView {
+    let shared_model = Arc::new(Mutex::new(startup.controller.model.clone()));
+    let controller = create_rw_signal(startup.controller);
     let store = Arc::new(store);
+    let startup_warning = startup.warning;
     let (notification_tx, notification_rx) = crossbeam_channel::unbounded();
     let terminal_events = create_signal_from_channel(notification_rx);
     {
@@ -87,12 +191,18 @@ fn shell_view(controller: AppController, store: SessionStore) -> impl IntoView {
         });
     }
 
-    app_shell(controller, store, shared_model, notification_tx)
+    app_shell(
+        controller,
+        store,
+        shared_model,
+        notification_tx,
+        startup_warning,
+    )
 }
 
 fn dispatch_action(controller: &mut AppController, store: &SessionStore, action: AppAction) {
     if controller.apply(action).is_ok() {
-        let _ = store.save_model(&controller.model);
+        save_session(store, &controller.model, "dispatch_action");
     }
 }
 
@@ -107,7 +217,7 @@ fn dispatch_actions(
     }
 
     if changed {
-        let _ = store.save_model(&controller.model);
+        save_session(store, &controller.model, "dispatch_actions");
     }
 }
 
@@ -149,10 +259,16 @@ fn apply_terminal_notification_event(
     }
 
     if changed {
-        let _ = store.save_model(&controller.model);
+        save_session(store, &controller.model, "terminal_notification");
     }
 
     changed
+}
+
+fn save_session(store: &SessionStore, model: &AppModel, reason: &'static str) {
+    if let Err(error) = store.save_model(model) {
+        warn!(%error, %reason, "failed to save session");
+    }
 }
 
 fn sync_model_mirror(controller: &AppController, shared_model: &SharedAppModel) {
@@ -166,12 +282,14 @@ fn app_shell(
     store: Arc<SessionStore>,
     shared_model: SharedAppModel,
     notification_sink: TerminalNotificationSink,
+    startup_warning: Option<StartupWarning>,
 ) -> impl IntoView {
     let shortcut_store = store.clone();
     let shortcut_shared_model = shared_model.clone();
 
     v_stack((
         top_bar(controller, store.clone(), shared_model.clone()),
+        startup_warning_banner(startup_warning),
         h_stack((
             sidebar(controller, store.clone(), shared_model.clone()),
             work_area(controller, store, shared_model, notification_sink),
@@ -198,6 +316,34 @@ fn app_shell(
         EventPropagation::Stop
     })
     .style(|s| s.size_full().background(BACKGROUND).color(TEXT))
+}
+
+fn startup_warning_banner(warning: Option<StartupWarning>) -> impl IntoView {
+    match warning {
+        Some(warning) => {
+            let message = startup_warning_banner_message(&warning);
+            container(label(move || message.clone()))
+                .style(|s| {
+                    s.height(30.0)
+                        .width_full()
+                        .items_center()
+                        .padding_horiz(14.0)
+                        .background(Color::rgb8(0x33, 0x2a, 0x18))
+                        .color(Color::rgb8(0xff, 0xdf, 0x9b))
+                        .font_size(12.0)
+                        .border_bottom(1.0)
+                        .border_color(Color::rgb8(0x5c, 0x45, 0x20))
+                })
+                .into_any()
+        }
+        None => container(empty())
+            .style(|s| s.height(0.0).width_full())
+            .into_any(),
+    }
+}
+
+fn startup_warning_banner_message(warning: &StartupWarning) -> String {
+    warning.message.clone()
 }
 
 fn runtime_shortcut_action(action: AppAction) -> AppAction {
@@ -894,8 +1040,10 @@ fn selected_workspace_title(controller: RwSignal<AppController>) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{Error, ErrorKind};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use umux_app::{AppAction, AppController, SessionStore};
+    use umux_app::session_store::SessionLoadOutcome;
+    use umux_app::{AppAction, AppController, SessionStore, SessionStoreError};
     use umux_core::model::{Pane, SplitTree, Surface, SurfaceKind, Workspace};
     use umux_core::{PaneId, SurfaceId, WorkspaceId};
 
@@ -993,6 +1141,85 @@ mod tests {
                 .as_ref()
                 .map(|target| target.surface_id),
             Some(surface_id)
+        );
+    }
+
+    #[test]
+    fn startup_load_decision_seeds_without_warning_when_session_is_missing() {
+        let decision =
+            startup_load_decision(Ok(SessionLoadOutcome::Missing), "C:/work/fresh".to_string());
+
+        assert!(!decision.restored);
+        assert_eq!(decision.warning, None);
+        assert_eq!(
+            decision.model.selected_workspace().unwrap().cwd,
+            "C:/work/fresh"
+        );
+    }
+
+    #[test]
+    fn startup_load_decision_warns_when_corrupt_session_was_recovered() {
+        let mut corrupt_path = SessionStore::default_path();
+        corrupt_path.set_file_name("session.json.corrupt.test");
+        let decision = startup_load_decision(
+            Ok(SessionLoadOutcome::RecoveredCorrupt { corrupt_path }),
+            "C:/work/fresh".to_string(),
+        );
+
+        assert!(!decision.restored);
+        assert_eq!(
+            decision.warning.map(|warning| warning.message),
+            Some(RECOVERED_SESSION_WARNING.to_string())
+        );
+        assert_eq!(
+            decision.model.selected_workspace().unwrap().cwd,
+            "C:/work/fresh"
+        );
+    }
+
+    #[test]
+    fn startup_load_decision_warns_when_session_file_cannot_be_read() {
+        let decision = startup_load_decision(
+            Err(SessionStoreError::Io(Error::new(
+                ErrorKind::PermissionDenied,
+                "denied",
+            ))),
+            "C:/work/fresh".to_string(),
+        );
+
+        assert!(!decision.restored);
+        assert_eq!(
+            decision.warning.map(|warning| warning.message),
+            Some(SESSION_READ_WARNING.to_string())
+        );
+        assert_eq!(
+            decision.model.selected_workspace().unwrap().cwd,
+            "C:/work/fresh"
+        );
+    }
+
+    #[test]
+    fn startup_load_decision_marks_loaded_session_as_restored() {
+        let model = AppModel::new("C:/work/restored");
+        let decision = startup_load_decision(
+            Ok(SessionLoadOutcome::Loaded(model.clone())),
+            "C:/work/fresh".to_string(),
+        );
+
+        assert!(decision.restored);
+        assert_eq!(decision.warning, None);
+        assert_eq!(decision.model, model);
+    }
+
+    #[test]
+    fn startup_warning_banner_message_uses_short_user_facing_text() {
+        let warning = StartupWarning {
+            message: RESTORE_CONTROLLER_WARNING.to_string(),
+        };
+
+        assert_eq!(
+            startup_warning_banner_message(&warning),
+            "Previous session could not be restored. Opened a fresh workspace."
         );
     }
 
