@@ -92,7 +92,7 @@ impl TerminalSessionController {
             Self::Internal { .. } => true,
             Self::External { entry, .. } => match entry.as_ref() {
                 TerminalEntry::Failed { .. } => false,
-                _ => entry.health().map_or(true, |health| {
+                _ => entry.health().is_none_or(|health| {
                     !matches!(
                         health.status,
                         TerminalStatus::Exited | TerminalStatus::Failed
@@ -406,6 +406,10 @@ fn start_external_terminal_session(
         entry,
         refresh_stop: Arc::new(AtomicBool::new(false)),
     });
+    if controller.snapshot().is_none() && controller.health().is_none() {
+        return controller;
+    }
+
     let refresh_stop = match controller.as_ref() {
         TerminalSessionController::External { refresh_stop, .. } => refresh_stop.clone(),
         TerminalSessionController::Internal { .. } => unreachable!(),
@@ -423,13 +427,13 @@ fn start_external_terminal_session(
                 controller.is_alive(),
                 controller.drain_notifications(),
             );
-            if let (Some(health), Some(snapshot)) = (controller.health(), controller.snapshot()) {
-                if !send_terminal_ui_state(
+            if let (Some(health), Some(snapshot)) = (controller.health(), controller.snapshot())
+                && !send_terminal_ui_state(
                     &state_tx,
                     TerminalUiState::from_health(health, snapshot),
-                ) {
-                    return;
-                }
+                )
+            {
+                return;
             }
             if !keep_running {
                 break;
@@ -536,13 +540,11 @@ fn start_terminal_session(
             std::thread::sleep(Duration::from_millis(33));
         }
 
-        if let Some(controller) = refresh_session.upgrade() {
-            if let (Some(health), Some(snapshot)) = (controller.health(), controller.snapshot()) {
-                let _ = send_terminal_ui_state(
-                    &state_tx,
-                    TerminalUiState::from_health(health, snapshot),
-                );
-            }
+        if let Some(controller) = refresh_session.upgrade()
+            && let (Some(health), Some(snapshot)) = (controller.health(), controller.snapshot())
+        {
+            let _ =
+                send_terminal_ui_state(&state_tx, TerminalUiState::from_health(health, snapshot));
         }
     });
 
