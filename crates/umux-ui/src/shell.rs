@@ -3,7 +3,9 @@
 use std::env;
 use std::sync::{Arc, Mutex};
 
+use floem::event::{Event, EventListener, EventPropagation};
 use floem::ext_event::create_signal_from_channel;
+use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 use floem::style::Style;
@@ -45,12 +47,14 @@ pub fn run() {
 }
 
 pub fn seed_model() -> AppModel {
-    let cwd = env::current_dir()
+    AppModel::new(current_dir_cwd())
+}
+
+fn current_dir_cwd() -> String {
+    env::current_dir()
         .ok()
         .map(|path| path.display().to_string())
-        .unwrap_or_else(|| ".".to_string());
-
-    AppModel::new(cwd)
+        .unwrap_or_else(|| ".".to_string())
 }
 
 fn app_view() -> impl IntoView {
@@ -162,6 +166,9 @@ fn app_shell(
     shared_model: SharedAppModel,
     notification_sink: TerminalNotificationSink,
 ) -> impl IntoView {
+    let shortcut_store = store.clone();
+    let shortcut_shared_model = shared_model.clone();
+
     v_stack((
         top_bar(controller, store.clone(), shared_model.clone()),
         h_stack((
@@ -170,7 +177,77 @@ fn app_shell(
         ))
         .style(|s| s.flex().width_full().height_full().min_width(0.0)),
     ))
+    .on_event(EventListener::KeyDown, move |event| {
+        let Event::KeyDown(event) = event else {
+            return EventPropagation::Continue;
+        };
+        let Some(chord) = chord_from_key_event(event) else {
+            return EventPropagation::Continue;
+        };
+        let Some(action) = action_for_shortcut(&chord).map(runtime_shortcut_action) else {
+            return EventPropagation::Continue;
+        };
+
+        dispatch_shell_action(
+            controller,
+            shortcut_store.clone(),
+            shortcut_shared_model.clone(),
+            action,
+        );
+        EventPropagation::Stop
+    })
     .style(|s| s.size_full().background(BACKGROUND).color(TEXT))
+}
+
+fn runtime_shortcut_action(action: AppAction) -> AppAction {
+    match action {
+        AppAction::NewWorkspace { cwd, title } if cwd == "." && title.is_none() => {
+            AppAction::NewWorkspace {
+                cwd: current_dir_cwd(),
+                title,
+            }
+        }
+        action => action,
+    }
+}
+
+fn action_for_shortcut(chord: &str) -> Option<AppAction> {
+    match chord {
+        "Ctrl+N" => Some(AppAction::NewWorkspace {
+            cwd: ".".to_string(),
+            title: None,
+        }),
+        "Ctrl+T" => Some(AppAction::NewTerminalTab),
+        "Ctrl+Alt+D" => Some(AppAction::SplitPane(SplitAxis::Vertical)),
+        "Ctrl+Shift+U" => Some(AppAction::JumpLatestUnread),
+        _ => None,
+    }
+}
+
+fn chord_from_key_event(event: &floem::keyboard::KeyEvent) -> Option<String> {
+    if event.modifiers.meta() || event.modifiers.altgr() {
+        return None;
+    }
+
+    let key = match &event.key.logical_key {
+        Key::Character(character) => character.to_uppercase(),
+        Key::Named(NamedKey::Enter) => "Enter".to_string(),
+        _ => return None,
+    };
+
+    let mut parts = Vec::new();
+    if event.modifiers.control() {
+        parts.push("Ctrl");
+    }
+    if event.modifiers.shift() {
+        parts.push("Shift");
+    }
+    if event.modifiers.alt() {
+        parts.push("Alt");
+    }
+    parts.push(&key);
+
+    Some(parts.join("+"))
 }
 
 fn top_bar(
@@ -224,10 +301,7 @@ fn sidebar(
         .style(|s| s.width_full().flex_col().gap(4.0)),
         button(label(|| "+ ws"))
             .action(move || {
-                let cwd = env::current_dir()
-                    .ok()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| ".".to_string());
+                let cwd = current_dir_cwd();
                 dispatch_shell_action(
                     controller,
                     store.clone(),
@@ -793,6 +867,30 @@ mod tests {
         surface.unread = true;
 
         assert_eq!(surface_tab_label(&surface), "Terminal *");
+    }
+
+    #[test]
+    fn maps_shell_shortcuts_to_actions() {
+        assert_eq!(
+            action_for_shortcut("Ctrl+N"),
+            Some(AppAction::NewWorkspace {
+                cwd: ".".to_string(),
+                title: None,
+            })
+        );
+        assert_eq!(
+            action_for_shortcut("Ctrl+T"),
+            Some(AppAction::NewTerminalTab)
+        );
+        assert_eq!(
+            action_for_shortcut("Ctrl+Alt+D"),
+            Some(AppAction::SplitPane(SplitAxis::Vertical))
+        );
+        assert_eq!(
+            action_for_shortcut("Ctrl+Shift+U"),
+            Some(AppAction::JumpLatestUnread)
+        );
+        assert_eq!(action_for_shortcut("Ctrl+X"), None);
     }
 
     #[test]

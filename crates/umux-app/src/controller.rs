@@ -79,6 +79,7 @@ impl AppController {
             }
             AppAction::SelectSurface(surface_id) => {
                 self.model.select_surface(surface_id)?;
+                self.model.mark_surface_read(surface_id)?;
             }
             AppAction::CloseSurface(surface_id) => {
                 let closed_surfaces = self.model.close_surface(surface_id)?;
@@ -94,6 +95,7 @@ impl AppController {
                 self.model.select_workspace(target.workspace_id)?;
                 self.model.select_pane(target.pane_id)?;
                 self.model.select_surface(target.surface_id)?;
+                self.model.mark_surface_read(target.surface_id)?;
             }
             AppAction::MarkSurfaceRead(surface_id) => {
                 self.model.mark_surface_read(surface_id)?;
@@ -313,12 +315,58 @@ mod tests {
     }
 
     #[test]
+    fn selecting_unread_surface_marks_it_read() {
+        let mut controller = AppController::new(AppModel::new("C:/work/alpha")).unwrap();
+        let first = controller.model.selected_pane().unwrap().selected_surface;
+        controller.apply(AppAction::NewTerminalTab).unwrap();
+        controller
+            .model
+            .mark_surface_unread(first, "done".to_string())
+            .unwrap();
+
+        controller.apply(AppAction::SelectSurface(first)).unwrap();
+
+        let surface = controller
+            .model
+            .selected_pane()
+            .unwrap()
+            .surface(first)
+            .unwrap();
+        assert!(!surface.unread);
+        assert_eq!(controller.model.latest_unread_target, None);
+    }
+
+    #[test]
     fn jump_latest_unread_without_target_returns_error() {
         let mut controller = AppController::new(AppModel::new("C:/work/alpha")).unwrap();
 
         let result = controller.apply(AppAction::JumpLatestUnread);
 
         assert_eq!(result, Err(AppControllerError::NoLatestUnreadTarget));
+    }
+
+    #[test]
+    fn closing_latest_unread_surface_clears_or_falls_back_target() {
+        let mut controller = AppController::new(AppModel::new("C:/work/alpha")).unwrap();
+        let first = controller.model.selected_pane().unwrap().selected_surface;
+        controller.apply(AppAction::NewTerminalTab).unwrap();
+        let second = controller.model.selected_pane().unwrap().selected_surface;
+        controller
+            .model
+            .mark_surface_unread(second, "done".to_string())
+            .unwrap();
+
+        controller.apply(AppAction::CloseSurface(second)).unwrap();
+
+        assert_ne!(
+            controller
+                .model
+                .latest_unread_target
+                .as_ref()
+                .map(|target| target.surface_id),
+            Some(second)
+        );
+        assert!(controller.terminals.contains(first));
     }
 
     #[test]
