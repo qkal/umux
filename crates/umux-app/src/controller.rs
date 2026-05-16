@@ -17,7 +17,7 @@ pub enum AppControllerError {
     NoLatestUnreadTarget,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct AppController {
     pub model: AppModel,
     pub terminals: TerminalRegistry,

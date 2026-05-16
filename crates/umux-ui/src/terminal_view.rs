@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(windows)]
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
@@ -12,13 +11,14 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::ext_event::create_signal_from_channel;
 use floem::keyboard::{Key, Modifiers, NamedKey};
 use floem::prelude::*;
+use umux_app::TerminalEntry;
 use umux_core::{AppModel, ModelError, PaneId, SurfaceId, WorkspaceId};
 #[cfg(windows)]
-use umux_terminal::{LiveTerminalSession, PtySpawnConfig, ShellResolver, TerminalHealth};
+use umux_terminal::{LiveTerminalSession, PtySpawnConfig, ShellResolver};
 use umux_terminal::{
-    StartupEnvironment, TerminalCell, TerminalColor, TerminalCursor, TerminalInputRoute,
-    TerminalInputRouter, TerminalKey, TerminalKeyEvent, TerminalMetrics, TerminalNotification,
-    TerminalRendererSnapshot, TerminalSelection,
+    StartupEnvironment, TerminalCell, TerminalColor, TerminalCursor, TerminalHealth,
+    TerminalInputRoute, TerminalInputRouter, TerminalKey, TerminalKeyEvent, TerminalMetrics,
+    TerminalNotification, TerminalRendererSnapshot, TerminalSelection, TerminalStatus,
 };
 
 #[cfg(windows)]
@@ -27,28 +27,89 @@ type UiTerminalSession = LiveTerminalSession;
 #[cfg(not(windows))]
 struct UiTerminalSession;
 
-struct TerminalSessionController {
-    session: Arc<UiTerminalSession>,
-    refresh_stop: Arc<AtomicBool>,
+enum TerminalSessionController {
+    Internal {
+        session: Arc<UiTerminalSession>,
+        refresh_stop: Arc<AtomicBool>,
+    },
+    External {
+        entry: Arc<TerminalEntry>,
+        refresh_stop: Arc<AtomicBool>,
+    },
 }
 
 impl TerminalSessionController {
     fn send_input(&self, input: impl AsRef<[u8]>) {
-        let _ = self.session.send_input(input);
+        match self {
+            Self::Internal { session, .. } => {
+                let _ = session.send_input(input);
+            }
+            Self::External { entry, .. } => entry.send_input(input),
+        }
     }
 
     fn resize(&self, cols: u16, rows: u16) {
-        let _ = self.session.resize(cols, rows);
+        match self {
+            Self::Internal { session, .. } => {
+                let _ = session.resize(cols, rows);
+            }
+            Self::External { entry, .. } => entry.resize(cols, rows),
+        }
     }
 
     fn drain_notifications(&self) -> Vec<TerminalNotification> {
-        self.session.drain_notifications()
+        match self {
+            Self::Internal { session, .. } => session.drain_notifications(),
+            Self::External { entry, .. } => entry.drain_notifications(),
+        }
+    }
+
+    fn snapshot(&self) -> Option<TerminalRendererSnapshot> {
+        match self {
+            #[cfg(windows)]
+            Self::Internal { session, .. } => Some(session.snapshot()),
+            #[cfg(not(windows))]
+            Self::Internal { .. } => None,
+            Self::External { entry, .. } => entry.snapshot(),
+        }
+    }
+
+    fn health(&self) -> Option<TerminalHealth> {
+        match self {
+            #[cfg(windows)]
+            Self::Internal { session, .. } => Some(session.health()),
+            #[cfg(not(windows))]
+            Self::Internal { .. } => None,
+            Self::External { entry, .. } => entry.health(),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        match self {
+            #[cfg(windows)]
+            Self::Internal { session, .. } => session.is_alive(),
+            #[cfg(not(windows))]
+            Self::Internal { .. } => true,
+            Self::External { entry, .. } => match entry.as_ref() {
+                TerminalEntry::Failed { .. } => false,
+                _ => entry.health().map_or(true, |health| {
+                    !matches!(
+                        health.status,
+                        TerminalStatus::Exited | TerminalStatus::Failed
+                    )
+                }),
+            },
+        }
     }
 }
 
 impl Drop for TerminalSessionController {
     fn drop(&mut self) {
-        self.refresh_stop.store(true, Ordering::Relaxed);
+        match self {
+            Self::Internal { refresh_stop, .. } | Self::External { refresh_stop, .. } => {
+                refresh_stop.store(true, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -81,7 +142,6 @@ impl TerminalUiState {
         }
     }
 
-    #[cfg(windows)]
     fn from_health(health: TerminalHealth, snapshot: TerminalRendererSnapshot) -> Self {
         Self {
             status: terminal_status_line(&health.shell, health.cols, health.rows),
@@ -122,6 +182,16 @@ impl TerminalLaunchContext {
         }
     }
 
+    fn from_entry(entry: &TerminalEntry) -> Self {
+        let spec = entry.spec();
+        Self {
+            cwd: spec.cwd.clone(),
+            workspace_id: spec.workspace_id,
+            pane_id: spec.pane_id,
+            surface_id: spec.surface_id,
+        }
+    }
+
     fn startup_environment(&self) -> std::collections::HashMap<String, String> {
         StartupEnvironment::new(
             self.workspace_id.0,
@@ -133,7 +203,15 @@ impl TerminalLaunchContext {
     }
 }
 
-type SharedAppModel = Arc<Mutex<AppModel>>;
+pub type SharedAppModel = Arc<Mutex<AppModel>>;
+
+enum TerminalSessionSource {
+    Internal(TerminalLaunchContext),
+    External {
+        context: TerminalLaunchContext,
+        entry: Arc<TerminalEntry>,
+    },
+}
 
 pub fn terminal_view() -> impl IntoView {
     terminal_view_for_cwd(".".to_string())
@@ -147,6 +225,21 @@ pub(crate) fn terminal_view_for_context(
     context: TerminalLaunchContext,
     model: Option<SharedAppModel>,
 ) -> impl IntoView {
+    terminal_view_for_source(TerminalSessionSource::Internal(context), model)
+}
+
+pub fn terminal_view_for_entry(
+    entry: Arc<TerminalEntry>,
+    model: Option<SharedAppModel>,
+) -> impl IntoView {
+    let context = TerminalLaunchContext::from_entry(&entry);
+    terminal_view_for_source(TerminalSessionSource::External { context, entry }, model)
+}
+
+fn terminal_view_for_source(
+    source: TerminalSessionSource,
+    model: Option<SharedAppModel>,
+) -> impl IntoView {
     let initial = TerminalUiState::initial("pwsh", "umux terminal MVP");
     let initial_status = initial.status.clone();
     let initial_snapshot = initial.snapshot.clone();
@@ -157,7 +250,7 @@ pub(crate) fn terminal_view_for_context(
     let dragging = create_rw_signal(false);
     let metrics = TerminalMetrics::new(8.0, 16.0);
 
-    let session = start_terminal_session(context, state_tx, model);
+    let session = start_terminal_session_for_source(source, state_tx, model);
     let session_for_key = session.clone();
     let session_for_grid_resize = session.clone();
     let grid_chrome = TerminalGridChrome::default();
@@ -286,6 +379,92 @@ pub(crate) fn terminal_view_for_context(
     })
 }
 
+fn start_terminal_session_for_source(
+    source: TerminalSessionSource,
+    state_tx: TerminalUiStateSink,
+    model: Option<SharedAppModel>,
+) -> Option<TerminalSessionHandle> {
+    match source {
+        TerminalSessionSource::Internal(context) => {
+            start_terminal_session(context, state_tx, model)
+        }
+        TerminalSessionSource::External { context, entry } => Some(
+            start_external_terminal_session(context, entry, state_tx, model),
+        ),
+    }
+}
+
+fn start_external_terminal_session(
+    context: TerminalLaunchContext,
+    entry: Arc<TerminalEntry>,
+    state_tx: TerminalUiStateSink,
+    model: Option<SharedAppModel>,
+) -> TerminalSessionHandle {
+    let surface_id = context.surface_id;
+    let _ = send_terminal_ui_state(&state_tx, initial_state_for_entry(&entry));
+    let controller = Arc::new(TerminalSessionController::External {
+        entry,
+        refresh_stop: Arc::new(AtomicBool::new(false)),
+    });
+    let refresh_stop = match controller.as_ref() {
+        TerminalSessionController::External { refresh_stop, .. } => refresh_stop.clone(),
+        TerminalSessionController::Internal { .. } => unreachable!(),
+    };
+    let refresh_session = Arc::downgrade(&controller);
+
+    std::thread::spawn(move || {
+        while refresh_loop_should_continue(&refresh_stop) {
+            let Some(controller) = refresh_session.upgrade() else {
+                return;
+            };
+            let keep_running = apply_terminal_refresh_result(
+                &model,
+                surface_id,
+                controller.is_alive(),
+                controller.drain_notifications(),
+            );
+            if let (Some(health), Some(snapshot)) = (controller.health(), controller.snapshot()) {
+                if !send_terminal_ui_state(
+                    &state_tx,
+                    TerminalUiState::from_health(health, snapshot),
+                ) {
+                    return;
+                }
+            }
+            if !keep_running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(33));
+        }
+
+        if let Some(controller) = refresh_session.upgrade()
+            && let (Some(health), Some(snapshot)) = (controller.health(), controller.snapshot())
+        {
+            let _ =
+                send_terminal_ui_state(&state_tx, TerminalUiState::from_health(health, snapshot));
+        }
+    });
+
+    controller
+}
+
+fn initial_state_for_entry(entry: &TerminalEntry) -> TerminalUiState {
+    if let (Some(health), Some(snapshot)) = (entry.health(), entry.snapshot()) {
+        return TerminalUiState::from_health(health, snapshot);
+    }
+
+    match entry {
+        TerminalEntry::Failed { message, .. } => TerminalUiState {
+            status: "terminal failed".to_string(),
+            snapshot: snapshot_from_text(&format!("Unable to start terminal: {message}"), 80, 24),
+        },
+        _ => TerminalUiState::initial(
+            "shell",
+            "umux terminal MVP\nlive terminal is available on Windows",
+        ),
+    }
+}
+
 #[cfg(windows)]
 fn start_terminal_session(
     context: TerminalLaunchContext,
@@ -321,11 +500,14 @@ fn start_terminal_session(
         }
     };
 
-    let controller = Arc::new(TerminalSessionController {
+    let controller = Arc::new(TerminalSessionController::Internal {
         session: Arc::new(session),
         refresh_stop: Arc::new(AtomicBool::new(false)),
     });
-    let refresh_stop = controller.refresh_stop.clone();
+    let refresh_stop = match controller.as_ref() {
+        TerminalSessionController::Internal { refresh_stop, .. } => refresh_stop.clone(),
+        TerminalSessionController::External { .. } => unreachable!(),
+    };
     let refresh_session = Arc::downgrade(&controller);
     std::thread::spawn(move || {
         while refresh_loop_should_continue(&refresh_stop) {
@@ -335,15 +517,19 @@ fn start_terminal_session(
             let keep_running = apply_terminal_refresh_result(
                 &model,
                 surface_id,
-                controller.session.is_alive(),
+                controller.is_alive(),
                 controller.drain_notifications(),
             );
             if !keep_running {
                 break;
             }
 
-            let snapshot = controller.session.snapshot();
-            let health = controller.session.health();
+            let Some(snapshot) = controller.snapshot() else {
+                return;
+            };
+            let Some(health) = controller.health() else {
+                return;
+            };
             if !send_terminal_ui_state(&state_tx, TerminalUiState::from_health(health, snapshot)) {
                 return;
             }
@@ -351,10 +537,12 @@ fn start_terminal_session(
         }
 
         if let Some(controller) = refresh_session.upgrade() {
-            let snapshot = controller.session.snapshot();
-            let health = controller.session.health();
-            let _ =
-                send_terminal_ui_state(&state_tx, TerminalUiState::from_health(health, snapshot));
+            if let (Some(health), Some(snapshot)) = (controller.health(), controller.snapshot()) {
+                let _ = send_terminal_ui_state(
+                    &state_tx,
+                    TerminalUiState::from_health(health, snapshot),
+                );
+            }
         }
     });
 
@@ -374,7 +562,7 @@ fn start_terminal_session(
             "umux terminal MVP\nlive terminal is available on Windows",
         ),
     );
-    Some(Arc::new(TerminalSessionController {
+    Some(Arc::new(TerminalSessionController::Internal {
         session: Arc::new(UiTerminalSession),
         refresh_stop: Arc::new(AtomicBool::new(false)),
     }))

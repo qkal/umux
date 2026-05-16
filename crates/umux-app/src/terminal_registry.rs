@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::sync::Arc;
 
 use thiserror::Error;
 use umux_core::{PaneId, SurfaceId, WorkspaceId};
+#[cfg(windows)]
+use umux_terminal::{PtySpawnConfig, ShellResolver, StartupEnvironment};
+use umux_terminal::{TerminalHealth, TerminalNotification, TerminalRendererSnapshot};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalSpawnSpec {
@@ -13,13 +18,83 @@ pub struct TerminalSpawnSpec {
     pub cwd: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub enum TerminalEntry {
-    Running(TerminalSpawnSpec),
+    #[cfg(windows)]
+    Running {
+        spec: TerminalSpawnSpec,
+        session: Arc<umux_terminal::LiveTerminalSession>,
+    },
+    #[cfg(not(windows))]
+    Running { spec: TerminalSpawnSpec },
     Failed {
         spec: TerminalSpawnSpec,
         message: String,
     },
+}
+
+impl TerminalEntry {
+    pub fn surface_id(&self) -> SurfaceId {
+        self.spec().surface_id
+    }
+
+    pub fn spec(&self) -> &TerminalSpawnSpec {
+        match self {
+            Self::Running { spec, .. } | Self::Failed { spec, .. } => spec,
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<TerminalRendererSnapshot> {
+        match self {
+            #[cfg(windows)]
+            Self::Running { session, .. } => Some(session.snapshot()),
+            #[cfg(not(windows))]
+            Self::Running { .. } => None,
+            Self::Failed { .. } => None,
+        }
+    }
+
+    pub fn health(&self) -> Option<TerminalHealth> {
+        match self {
+            #[cfg(windows)]
+            Self::Running { session, .. } => Some(session.health()),
+            #[cfg(not(windows))]
+            Self::Running { .. } => None,
+            Self::Failed { .. } => None,
+        }
+    }
+
+    pub fn send_input(&self, input: impl AsRef<[u8]>) {
+        #[cfg(windows)]
+        {
+            if let Self::Running { session, .. } = self {
+                let _ = session.send_input(input);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = input;
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        #[cfg(windows)]
+        {
+            if let Self::Running { session, .. } = self {
+                let _ = session.resize(cols, rows);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (cols, rows);
+    }
+
+    pub fn drain_notifications(&self) -> Vec<TerminalNotification> {
+        match self {
+            #[cfg(windows)]
+            Self::Running { session, .. } => session.drain_notifications(),
+            #[cfg(not(windows))]
+            Self::Running { .. } => Vec::new(),
+            Self::Failed { .. } => Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -28,7 +103,7 @@ pub enum TerminalRegistryError {
     AlreadyRegistered(SurfaceId),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default)]
 pub struct TerminalRegistry {
     entries: HashMap<SurfaceId, TerminalEntry>,
 }
@@ -43,8 +118,9 @@ impl TerminalRegistry {
         if self.entries.contains_key(&surface_id) {
             return Err(TerminalRegistryError::AlreadyRegistered(surface_id));
         }
-        self.entries
-            .insert(surface_id, TerminalEntry::Running(spec));
+
+        let entry = spawn_terminal_entry(spec);
+        self.entries.insert(entry.surface_id(), entry);
         Ok(())
     }
 
@@ -62,5 +138,90 @@ impl TerminalRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub fn entry(&self, surface_id: SurfaceId) -> Option<&TerminalEntry> {
+        self.entries.get(&surface_id)
+    }
+
+    pub fn running_surface_ids(&self) -> Vec<SurfaceId> {
+        let mut ids = self.entries.keys().copied().collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+}
+
+#[cfg(windows)]
+fn spawn_terminal_entry(spec: TerminalSpawnSpec) -> TerminalEntry {
+    let shell = ShellResolver::from_path().resolve();
+    let env = StartupEnvironment::new(
+        spec.workspace_id.0,
+        spec.pane_id.0,
+        spec.surface_id.0,
+        spec.cwd.clone(),
+    )
+    .into_pairs();
+    let config = PtySpawnConfig {
+        shell,
+        cwd: spec.cwd.clone(),
+        env,
+        cols: 80,
+        rows: 24,
+    };
+
+    match umux_terminal::LiveTerminalSession::spawn(config) {
+        Ok(session) => TerminalEntry::Running {
+            spec,
+            session: Arc::new(session),
+        },
+        Err(error) => TerminalEntry::Failed {
+            spec,
+            message: error.to_string(),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_terminal_entry(spec: TerminalSpawnSpec) -> TerminalEntry {
+    TerminalEntry::Running { spec }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(surface_id: u64) -> TerminalSpawnSpec {
+        TerminalSpawnSpec {
+            workspace_id: WorkspaceId(1),
+            pane_id: PaneId(2),
+            surface_id: SurfaceId(surface_id),
+            cwd: "C:/work/alpha".to_string(),
+        }
+    }
+
+    #[test]
+    fn registry_removes_closed_sessions() {
+        let mut registry = TerminalRegistry::new();
+        registry.spawn(spec(20)).unwrap();
+        registry.spawn(spec(10)).unwrap();
+
+        let removed = registry.remove(SurfaceId(20)).unwrap();
+
+        assert_eq!(removed.surface_id(), SurfaceId(20));
+        assert!(!registry.contains(SurfaceId(20)));
+        assert_eq!(registry.running_surface_ids(), vec![SurfaceId(10)]);
+    }
+
+    #[test]
+    fn registry_exposes_snapshot_entry_for_ui() {
+        let mut registry = TerminalRegistry::new();
+        let surface_id = SurfaceId(30);
+        registry.spawn(spec(surface_id.0)).unwrap();
+
+        let entry = registry.entry(surface_id).unwrap();
+
+        assert_eq!(entry.surface_id(), surface_id);
+        assert_eq!(entry.snapshot(), None);
+        assert_eq!(entry.health(), None);
     }
 }

@@ -8,5 +8,6 @@ rust-version.workspace = true
 [dependencies]
 crossbeam-channel.workspace = true
 floem.workspace = true
+umux-app = { path = "../umux-app" }
 umux-core = { path = "../umux-core" }
 umux-terminal = { path = "../umux-terminal" }
