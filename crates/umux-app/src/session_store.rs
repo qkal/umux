@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
-    fs,
-    io::ErrorKind,
+    fs::{self, File},
+    io::{self, ErrorKind, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -34,6 +34,9 @@ impl SessionStore {
     }
 
     pub fn save_model(&self, model: &AppModel) -> Result<(), SessionStoreError> {
+        let snapshot = AppSnapshot::from_model(model);
+        let json = snapshot.to_json_string()?;
+
         if let Some(parent) = self
             .path
             .parent()
@@ -42,8 +45,17 @@ impl SessionStore {
             fs::create_dir_all(parent)?;
         }
 
-        let snapshot = AppSnapshot::from_model(model);
-        fs::write(&self.path, snapshot.to_json_string()?)?;
+        let temp_path = temp_save_path(&self.path, std::process::id(), current_nanos());
+        let mut temp_file = File::create(&temp_path)?;
+        temp_file.write_all(json.as_bytes())?;
+        temp_file.sync_all()?;
+        drop(temp_file);
+
+        if let Err(error) = persist_temp_file(&temp_path, &self.path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error.into());
+        }
+
         Ok(())
     }
 
@@ -101,6 +113,65 @@ fn sibling_path(path: &Utf8Path, file_name: &str) -> Utf8PathBuf {
     }
 }
 
+fn temp_save_path(path: &Utf8Path, process_id: u32, nanos: u128) -> Utf8PathBuf {
+    let file_name = path.file_name().unwrap_or("session.json");
+    sibling_path(path, &format!("{file_name}.tmp.{process_id}.{nanos}"))
+}
+
+fn current_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+#[cfg(not(windows))]
+fn persist_temp_file(temp_path: &Utf8Path, target_path: &Utf8Path) -> Result<(), io::Error> {
+    fs::rename(temp_path, target_path)
+}
+
+#[cfg(windows)]
+fn persist_temp_file(temp_path: &Utf8Path, target_path: &Utf8Path) -> Result<(), io::Error> {
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let temp_path = wide_path(temp_path);
+    let target_path = wide_path(target_path);
+    let result = unsafe {
+        MoveFileExW(
+            temp_path.as_ptr(),
+            target_path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Utf8Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_std_path()
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -111,7 +182,7 @@ mod tests {
     use camino::Utf8PathBuf;
     use umux_core::AppModel;
 
-    use super::SessionStore;
+    use super::{SessionStore, temp_save_path};
 
     #[test]
     fn save_and_load_round_trip_model() {
@@ -127,6 +198,43 @@ mod tests {
 
         assert_eq!(loaded.windows[0].workspaces.len(), 2);
         assert_eq!(loaded.selected_workspace().unwrap().title, "Beta");
+    }
+
+    #[test]
+    fn saving_twice_replaces_session_and_leaves_no_temp_siblings() {
+        let dir = temp_session_path("replace");
+        let session_path = dir.join("session.json");
+        let store = SessionStore::new(session_path);
+        let first = AppModel::new("C:/work/alpha");
+        let mut second = AppModel::new("C:/work/alpha");
+        second
+            .create_workspace("C:/work/beta", Some("Beta".to_string()))
+            .unwrap();
+
+        store.save_model(&first).unwrap();
+        store.save_model(&second).unwrap();
+
+        let loaded = store.load_model().unwrap().unwrap();
+        assert_eq!(loaded.selected_workspace().unwrap().title, "Beta");
+        assert!(!fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")
+        }));
+    }
+
+    #[test]
+    fn temp_save_path_uses_same_directory_target_name_process_and_time() {
+        let path = Utf8PathBuf::from("C:/work/session.json");
+
+        let temp_path = temp_save_path(&path, 123, 456);
+
+        assert_eq!(
+            temp_path,
+            Utf8PathBuf::from("C:/work/session.json.tmp.123.456")
+        );
     }
 
     #[test]
