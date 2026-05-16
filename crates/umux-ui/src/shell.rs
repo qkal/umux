@@ -91,6 +91,21 @@ fn dispatch_action(controller: &mut AppController, store: &SessionStore, action:
     }
 }
 
+fn dispatch_actions(
+    controller: &mut AppController,
+    store: &SessionStore,
+    actions: impl IntoIterator<Item = AppAction>,
+) {
+    let mut changed = false;
+    for action in actions {
+        changed |= controller.apply(action).is_ok();
+    }
+
+    if changed {
+        let _ = store.save_model(&controller.model);
+    }
+}
+
 fn dispatch_shell_action(
     controller: RwSignal<AppController>,
     store: Arc<SessionStore>,
@@ -99,6 +114,18 @@ fn dispatch_shell_action(
 ) {
     controller.update(move |controller| {
         dispatch_action(controller, store.as_ref(), action);
+        sync_model_mirror(controller, &shared_model);
+    });
+}
+
+fn dispatch_shell_actions(
+    controller: RwSignal<AppController>,
+    store: Arc<SessionStore>,
+    shared_model: SharedAppModel,
+    actions: impl IntoIterator<Item = AppAction> + 'static,
+) {
+    controller.update(move |controller| {
+        dispatch_actions(controller, store.as_ref(), actions);
         sync_model_mirror(controller, &shared_model);
     });
 }
@@ -227,64 +254,28 @@ fn work_area(
     shared_model: SharedAppModel,
     notification_sink: TerminalNotificationSink,
 ) -> impl IntoView {
-    let layout_store = store.clone();
-    let layout_shared_model = shared_model.clone();
-
     v_stack((
         workspace_controls(controller, store.clone(), shared_model.clone()),
-        dyn_container(
-            move || pane_layout(controller),
-            move |layout| {
-                pane_layout_view(
-                    layout,
+        dyn_stack(
+            move || pane_identity_rows_for_controller(controller),
+            pane_row_key,
+            move |pane| {
+                pane_view(
+                    pane,
                     controller,
-                    layout_store.clone(),
-                    layout_shared_model.clone(),
+                    store.clone(),
+                    shared_model.clone(),
                     notification_sink.clone(),
                 )
             },
         )
-        .style(|s| s.width_full().height_full().min_height(0.0)),
+        .style(move |s| pane_stack_style(s, split_direction_for_controller(controller))),
     ))
     .style(|s| {
         s.width_full()
             .height_full()
             .min_width(0.0)
             .background(BACKGROUND)
-    })
-}
-
-fn pane_layout_view(
-    layout: PaneLayout,
-    controller: RwSignal<AppController>,
-    store: Arc<SessionStore>,
-    shared_model: SharedAppModel,
-    notification_sink: TerminalNotificationSink,
-) -> impl IntoView {
-    let direction = layout.direction;
-    dyn_stack(
-        move || layout.panes.clone(),
-        pane_row_key,
-        move |pane| {
-            pane_view(
-                pane,
-                controller,
-                store.clone(),
-                shared_model.clone(),
-                notification_sink.clone(),
-            )
-        },
-    )
-    .style(move |s| {
-        let s = match direction {
-            PaneStackDirection::Row => s.flex_row(),
-            PaneStackDirection::Column => s.flex_col(),
-        };
-        s.width_full()
-            .height_full()
-            .min_height(0.0)
-            .gap(1.0)
-            .background(Color::rgb8(0x25, 0x2a, 0x32))
     })
 }
 
@@ -349,7 +340,7 @@ fn pane_view(
 
     v_stack((
         dyn_stack(
-            move || surface_tab_rows(controller, pane_id),
+            move || surface_tab_identity_rows(controller, pane_id),
             surface_tab_key,
             move |tab| {
                 surface_tab_button(
@@ -381,7 +372,7 @@ fn pane_view(
         .style(|s| s.width_full().height_full().min_height(0.0)),
     ))
     .style(move |s| {
-        let border = if pane.selected {
+        let border = if pane_selected(controller, pane.id) {
             UNREAD_BLUE
         } else {
             Color::rgb8(0x25, 0x2a, 0x32)
@@ -431,32 +422,42 @@ fn workspace_row_button(
     store: Arc<SessionStore>,
     shared_model: SharedAppModel,
 ) -> impl IntoView {
-    let action = AppAction::SelectWorkspace(row.id);
-    button(label(move || row.label.clone()).style(|s| s.text_ellipsis()))
-        .action(move || {
-            dispatch_shell_action(
-                controller,
-                store.clone(),
-                shared_model.clone(),
-                action.clone(),
-            );
+    let workspace_id = row.id;
+    let action = AppAction::SelectWorkspace(workspace_id);
+    button(
+        label(move || {
+            workspace_row_state_for_controller(controller, workspace_id)
+                .map(|state| state.label)
+                .unwrap_or_else(|| "Workspace".to_string())
         })
-        .style(move |s| {
-            let background = if row.selected {
-                Color::rgb8(0x22, 0x28, 0x31)
-            } else {
-                PANEL
-            };
-            s.width_full()
-                .height(28.0)
-                .items_center()
-                .justify_start()
-                .padding_horiz(8.0)
-                .background(background)
-                .color(TEXT)
-                .font_size(12.0)
-                .border_radius(4.0)
-        })
+        .style(|s| s.text_ellipsis()),
+    )
+    .action(move || {
+        dispatch_shell_action(
+            controller,
+            store.clone(),
+            shared_model.clone(),
+            action.clone(),
+        );
+    })
+    .style(move |s| {
+        let background = if workspace_row_state_for_controller(controller, workspace_id)
+            .is_some_and(|state| state.selected)
+        {
+            Color::rgb8(0x22, 0x28, 0x31)
+        } else {
+            PANEL
+        };
+        s.width_full()
+            .height(28.0)
+            .items_center()
+            .justify_start()
+            .padding_horiz(8.0)
+            .background(background)
+            .color(TEXT)
+            .font_size(12.0)
+            .border_radius(4.0)
+    })
 }
 
 fn surface_tab_button(
@@ -467,37 +468,43 @@ fn surface_tab_button(
     shared_model: SharedAppModel,
 ) -> impl IntoView {
     let surface_id = tab.id;
-    button(label(move || tab.label.clone()).style(|s| s.text_ellipsis()))
-        .action(move || {
-            dispatch_shell_action(
-                controller,
-                store.clone(),
-                shared_model.clone(),
+    button(
+        label(move || {
+            surface_tab_state_for_controller(controller, pane_id, surface_id)
+                .map(|state| state.label)
+                .unwrap_or_else(|| "Terminal".to_string())
+        })
+        .style(|s| s.text_ellipsis()),
+    )
+    .action(move || {
+        dispatch_shell_actions(
+            controller,
+            store.clone(),
+            shared_model.clone(),
+            [
                 AppAction::SelectPane(pane_id),
-            );
-            dispatch_shell_action(
-                controller,
-                store.clone(),
-                shared_model.clone(),
                 AppAction::SelectSurface(surface_id),
-            );
-        })
-        .style(move |s| {
-            let background = if tab.selected {
-                Color::rgb8(0x22, 0x28, 0x31)
-            } else {
-                Color::rgb8(0x14, 0x17, 0x1b)
-            };
-            s.height(24.0)
-                .min_width(72.0)
-                .max_width(160.0)
-                .items_center()
-                .padding_horiz(10.0)
-                .background(background)
-                .color(TEXT)
-                .font_size(12.0)
-                .border_radius(4.0)
-        })
+            ],
+        );
+    })
+    .style(move |s| {
+        let background = if surface_tab_state_for_controller(controller, pane_id, surface_id)
+            .is_some_and(|state| state.selected)
+        {
+            Color::rgb8(0x22, 0x28, 0x31)
+        } else {
+            Color::rgb8(0x14, 0x17, 0x1b)
+        };
+        s.height(24.0)
+            .min_width(72.0)
+            .max_width(160.0)
+            .items_center()
+            .padding_horiz(10.0)
+            .background(background)
+            .color(TEXT)
+            .font_size(12.0)
+            .border_radius(4.0)
+    })
 }
 
 fn compact_button_style(s: Style) -> Style {
@@ -515,6 +522,10 @@ fn compact_button_style(s: Style) -> Style {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkspaceRow {
     id: WorkspaceId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceRowState {
     label: String,
     selected: bool,
 }
@@ -522,9 +533,9 @@ struct WorkspaceRow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PaneRow {
     id: PaneId,
-    selected: bool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaneLayout {
     direction: PaneStackDirection,
@@ -540,6 +551,10 @@ enum PaneStackDirection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SurfaceTabRow {
     id: SurfaceId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SurfaceTabState {
     label: String,
     selected: bool,
 }
@@ -576,43 +591,67 @@ fn workspace_rows(controller: RwSignal<AppController>) -> Vec<WorkspaceRow> {
             window
                 .workspaces
                 .iter()
-                .map(|workspace| WorkspaceRow {
-                    id: workspace.id,
-                    label: workspace_row_label(workspace),
-                    selected: workspace.id == window.selected_workspace,
-                })
+                .map(|workspace| WorkspaceRow { id: workspace.id })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn pane_layout(controller: RwSignal<AppController>) -> PaneLayout {
+fn workspace_row_state_for_controller(
+    controller: RwSignal<AppController>,
+    workspace_id: WorkspaceId,
+) -> Option<WorkspaceRowState> {
+    workspace_row_state(&controller.get().model, workspace_id)
+}
+
+fn workspace_row_state(model: &AppModel, workspace_id: WorkspaceId) -> Option<WorkspaceRowState> {
+    let window = model.selected_window().ok()?;
+    let workspace = window.workspace(workspace_id)?;
+    Some(WorkspaceRowState {
+        label: workspace_row_label(workspace),
+        selected: window.selected_workspace == workspace_id,
+    })
+}
+
+#[cfg(test)]
+fn pane_layout_for_workspace(workspace: &Workspace) -> PaneLayout {
+    PaneLayout {
+        direction: split_direction_for_workspace(workspace),
+        panes: pane_identity_rows(workspace),
+    }
+}
+
+fn pane_identity_rows_for_controller(controller: RwSignal<AppController>) -> Vec<PaneRow> {
     controller
         .get()
         .model
         .selected_workspace()
-        .map(pane_layout_for_workspace)
-        .unwrap_or_else(|_| PaneLayout {
-            direction: PaneStackDirection::Column,
-            panes: Vec::new(),
-        })
+        .map(pane_identity_rows)
+        .unwrap_or_default()
 }
 
-fn pane_layout_for_workspace(workspace: &Workspace) -> PaneLayout {
+fn pane_identity_rows(workspace: &Workspace) -> Vec<PaneRow> {
     match workspace.layout {
-        SplitTree::Leaf(pane_id) => PaneLayout {
-            direction: PaneStackDirection::Column,
-            panes: vec![pane_row(workspace, pane_id)],
-        },
-        SplitTree::Split {
-            axis,
-            first,
-            second,
-            ..
-        } => PaneLayout {
-            direction: pane_stack_direction(axis),
-            panes: vec![pane_row(workspace, first), pane_row(workspace, second)],
-        },
+        SplitTree::Leaf(pane_id) => vec![PaneRow { id: pane_id }],
+        SplitTree::Split { first, second, .. } => {
+            vec![PaneRow { id: first }, PaneRow { id: second }]
+        }
+    }
+}
+
+fn split_direction_for_controller(controller: RwSignal<AppController>) -> PaneStackDirection {
+    controller
+        .get()
+        .model
+        .selected_workspace()
+        .map(split_direction_for_workspace)
+        .unwrap_or(PaneStackDirection::Column)
+}
+
+fn split_direction_for_workspace(workspace: &Workspace) -> PaneStackDirection {
+    match workspace.layout {
+        SplitTree::Leaf(_) => PaneStackDirection::Column,
+        SplitTree::Split { axis, .. } => pane_stack_direction(axis),
     }
 }
 
@@ -623,14 +662,30 @@ fn pane_stack_direction(axis: SplitAxis) -> PaneStackDirection {
     }
 }
 
-fn pane_row(workspace: &Workspace, pane_id: PaneId) -> PaneRow {
-    PaneRow {
-        id: pane_id,
-        selected: workspace.selected_pane == pane_id,
-    }
+fn pane_stack_style(s: Style, direction: PaneStackDirection) -> Style {
+    let s = match direction {
+        PaneStackDirection::Row => s.flex_row(),
+        PaneStackDirection::Column => s.flex_col(),
+    };
+    s.width_full()
+        .height_full()
+        .min_height(0.0)
+        .gap(1.0)
+        .background(Color::rgb8(0x25, 0x2a, 0x32))
 }
 
-fn surface_tab_rows(controller: RwSignal<AppController>, pane_id: PaneId) -> Vec<SurfaceTabRow> {
+fn pane_selected(controller: RwSignal<AppController>, pane_id: PaneId) -> bool {
+    controller
+        .get()
+        .model
+        .selected_workspace()
+        .is_ok_and(|workspace| workspace.selected_pane == pane_id)
+}
+
+fn surface_tab_identity_rows(
+    controller: RwSignal<AppController>,
+    pane_id: PaneId,
+) -> Vec<SurfaceTabRow> {
     controller
         .get()
         .model
@@ -640,14 +695,34 @@ fn surface_tab_rows(controller: RwSignal<AppController>, pane_id: PaneId) -> Vec
         .map(|pane| {
             pane.surfaces
                 .iter()
-                .map(|surface| SurfaceTabRow {
-                    id: surface.id,
-                    label: surface_tab_label(surface),
-                    selected: pane.selected_surface == surface.id,
-                })
+                .map(|surface| SurfaceTabRow { id: surface.id })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn surface_tab_state_for_controller(
+    controller: RwSignal<AppController>,
+    pane_id: PaneId,
+    surface_id: SurfaceId,
+) -> Option<SurfaceTabState> {
+    surface_tab_state(&controller.get().model, pane_id, surface_id)
+}
+
+fn surface_tab_state(
+    model: &AppModel,
+    pane_id: PaneId,
+    surface_id: SurfaceId,
+) -> Option<SurfaceTabState> {
+    let pane = model
+        .selected_workspace()
+        .ok()
+        .and_then(|workspace| workspace.pane(pane_id))?;
+    let surface = pane.surface(surface_id)?;
+    Some(SurfaceTabState {
+        label: surface_tab_label(surface),
+        selected: pane.selected_surface == surface_id,
+    })
 }
 
 fn terminal_content_rows(
@@ -799,30 +874,75 @@ mod tests {
     fn dynamic_row_keys_ignore_label_and_selected_state() {
         let workspace_before = WorkspaceRow {
             id: WorkspaceId(10),
-            label: "alpha".to_string(),
-            selected: false,
         };
         let workspace_after = WorkspaceRow {
             id: WorkspaceId(10),
-            label: "alpha *".to_string(),
-            selected: true,
         };
-        let tab_before = SurfaceTabRow {
-            id: SurfaceId(20),
-            label: "Terminal".to_string(),
-            selected: false,
-        };
-        let tab_after = SurfaceTabRow {
-            id: SurfaceId(20),
-            label: "Terminal *".to_string(),
-            selected: true,
-        };
+        let tab_before = SurfaceTabRow { id: SurfaceId(20) };
+        let tab_after = SurfaceTabRow { id: SurfaceId(20) };
 
         assert_eq!(
             workspace_row_key(&workspace_before),
             workspace_row_key(&workspace_after)
         );
         assert_eq!(surface_tab_key(&tab_before), surface_tab_key(&tab_after));
+    }
+
+    #[test]
+    fn workspace_row_state_recomputes_by_id_after_model_changes() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let alpha = model.selected_workspace().unwrap().id;
+        let beta = model
+            .create_workspace("C:/work/beta", Some("Beta".to_string()))
+            .unwrap();
+        let beta_surface = model.selected_pane().unwrap().selected_surface;
+
+        let before = workspace_row_state(&model, alpha).unwrap();
+        model
+            .mark_surface_unread(beta_surface, "done".to_string())
+            .unwrap();
+        let alpha_after = workspace_row_state(&model, alpha).unwrap();
+        let beta_after = workspace_row_state(&model, beta).unwrap();
+
+        assert_eq!(before.label, "alpha");
+        assert!(!before.selected);
+        assert_eq!(alpha_after.label, "alpha");
+        assert!(!alpha_after.selected);
+        assert_eq!(beta_after.label, "Beta *");
+        assert!(beta_after.selected);
+    }
+
+    #[test]
+    fn surface_tab_state_recomputes_by_id_after_model_changes() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let pane_id = model.selected_pane().unwrap().id;
+        let first = model.selected_pane().unwrap().selected_surface;
+        let second = model.open_terminal_surface().unwrap();
+
+        model
+            .mark_surface_unread(first, "first done".to_string())
+            .unwrap();
+        let first_state = surface_tab_state(&model, pane_id, first).unwrap();
+        let second_state = surface_tab_state(&model, pane_id, second).unwrap();
+
+        assert_eq!(first_state.label, "Terminal *");
+        assert!(!first_state.selected);
+        assert_eq!(second_state.label, "Terminal");
+        assert!(second_state.selected);
+    }
+
+    #[test]
+    fn pane_identity_rows_ignore_selected_state() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let first = model.selected_pane().unwrap().id;
+        let second = model.split_selected_pane(SplitAxis::Vertical).unwrap();
+
+        let before = pane_identity_rows(model.selected_workspace().unwrap());
+        model.select_pane(first).unwrap();
+        let after = pane_identity_rows(model.selected_workspace().unwrap());
+
+        assert_eq!(before, vec![PaneRow { id: first }, PaneRow { id: second }]);
+        assert_eq!(before, after);
     }
 
     fn workspace(title: &str) -> Workspace {
