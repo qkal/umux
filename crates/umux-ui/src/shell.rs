@@ -3,14 +3,19 @@
 use std::env;
 use std::sync::{Arc, Mutex};
 
+use floem::ext_event::create_signal_from_channel;
 use floem::prelude::*;
+use floem::reactive::create_effect;
 use floem::style::Style;
 use umux_app::{AppAction, AppController, SessionStore, TerminalEntry};
 use umux_core::AppModel;
 use umux_core::model::{SplitTree, Workspace};
 use umux_core::{PaneId, SplitAxis, SurfaceId, SurfaceKind, WorkspaceId};
 
-use crate::terminal_view::{SharedAppModel, terminal_view_for_entry};
+use crate::terminal_view::{
+    SharedAppModel, TerminalNotificationEvent, TerminalNotificationSink,
+    terminal_view_for_entry_with_notifications,
+};
 use crate::theme::{SIDEBAR_WIDTH, SURFACE_TAB_HEIGHT, TOP_BAR_HEIGHT};
 
 const BACKGROUND: Color = Color::rgb8(0x11, 0x13, 0x16);
@@ -50,11 +55,7 @@ pub fn seed_model() -> AppModel {
 
 fn app_view() -> impl IntoView {
     let store = SessionStore::new(SessionStore::default_path());
-    let model = store
-        .load_model()
-        .ok()
-        .flatten()
-        .unwrap_or_else(seed_model);
+    let model = store.load_model().ok().flatten().unwrap_or_else(seed_model);
     let controller = AppController::from_restored_model(model).unwrap_or_else(|_| {
         AppController::new(seed_model()).expect("seed model should create an app controller")
     });
@@ -65,7 +66,23 @@ fn app_view() -> impl IntoView {
 fn shell_view(controller: AppController, store: SessionStore) -> impl IntoView {
     let shared_model = Arc::new(Mutex::new(controller.model.clone()));
     let controller = create_rw_signal(controller);
-    app_shell(controller, Arc::new(store), shared_model)
+    let store = Arc::new(store);
+    let (notification_tx, notification_rx) = crossbeam_channel::unbounded();
+    let terminal_events = create_signal_from_channel(notification_rx);
+    {
+        let store = store.clone();
+        let shared_model = shared_model.clone();
+        create_effect(move |_| {
+            if let Some(event) = terminal_events.get() {
+                controller.update(|controller| {
+                    apply_terminal_notification_event(controller, store.as_ref(), event);
+                    sync_model_mirror(controller, &shared_model);
+                });
+            }
+        });
+    }
+
+    app_shell(controller, store, shared_model, notification_tx)
 }
 
 fn dispatch_action(controller: &mut AppController, store: &SessionStore, action: AppAction) {
@@ -82,22 +99,47 @@ fn dispatch_shell_action(
 ) {
     controller.update(move |controller| {
         dispatch_action(controller, store.as_ref(), action);
-        if let Ok(mut model) = shared_model.lock() {
-            *model = controller.model.clone();
-        }
+        sync_model_mirror(controller, &shared_model);
     });
+}
+
+fn apply_terminal_notification_event(
+    controller: &mut AppController,
+    store: &SessionStore,
+    event: TerminalNotificationEvent,
+) -> bool {
+    let mut changed = false;
+    for notification in event.notifications {
+        changed |= controller
+            .model
+            .mark_surface_unread(event.surface_id, notification.message)
+            .is_ok();
+    }
+
+    if changed {
+        let _ = store.save_model(&controller.model);
+    }
+
+    changed
+}
+
+fn sync_model_mirror(controller: &AppController, shared_model: &SharedAppModel) {
+    if let Ok(mut model) = shared_model.lock() {
+        *model = controller.model.clone();
+    }
 }
 
 fn app_shell(
     controller: RwSignal<AppController>,
     store: Arc<SessionStore>,
     shared_model: SharedAppModel,
+    notification_sink: TerminalNotificationSink,
 ) -> impl IntoView {
     v_stack((
         top_bar(controller, store.clone(), shared_model.clone()),
         h_stack((
             sidebar(controller, store.clone(), shared_model.clone()),
-            work_area(controller, store, shared_model),
+            work_area(controller, store, shared_model, notification_sink),
         ))
         .style(|s| s.flex().width_full().height_full().min_width(0.0)),
     ))
@@ -147,14 +189,9 @@ fn sidebar(
         label(|| "workspaces").style(|s| s.color(MUTED_TEXT).font_size(11.0)),
         dyn_stack(
             move || workspace_rows(controller),
-            |row| (row.id, row.label.clone(), row.selected),
+            workspace_row_key,
             move |row| {
-                workspace_row_button(
-                    row,
-                    controller,
-                    row_store.clone(),
-                    row_shared_model.clone(),
-                )
+                workspace_row_button(row, controller, row_store.clone(), row_shared_model.clone())
             },
         )
         .style(|s| s.width_full().flex_col().gap(4.0)),
@@ -188,28 +225,66 @@ fn work_area(
     controller: RwSignal<AppController>,
     store: Arc<SessionStore>,
     shared_model: SharedAppModel,
+    notification_sink: TerminalNotificationSink,
 ) -> impl IntoView {
+    let layout_store = store.clone();
+    let layout_shared_model = shared_model.clone();
+
     v_stack((
         workspace_controls(controller, store.clone(), shared_model.clone()),
-        dyn_stack(
-            move || pane_rows(controller),
-            |pane| (pane.id, pane.selected),
-            move |pane| pane_view(pane, controller, store.clone(), shared_model.clone()),
+        dyn_container(
+            move || pane_layout(controller),
+            move |layout| {
+                pane_layout_view(
+                    layout,
+                    controller,
+                    layout_store.clone(),
+                    layout_shared_model.clone(),
+                    notification_sink.clone(),
+                )
+            },
         )
-        .style(|s| {
-            s.width_full()
-                .height_full()
-                .min_height(0.0)
-                .flex_col()
-                .gap(1.0)
-                .background(Color::rgb8(0x25, 0x2a, 0x32))
-        }),
+        .style(|s| s.width_full().height_full().min_height(0.0)),
     ))
     .style(|s| {
         s.width_full()
             .height_full()
             .min_width(0.0)
             .background(BACKGROUND)
+    })
+}
+
+fn pane_layout_view(
+    layout: PaneLayout,
+    controller: RwSignal<AppController>,
+    store: Arc<SessionStore>,
+    shared_model: SharedAppModel,
+    notification_sink: TerminalNotificationSink,
+) -> impl IntoView {
+    let direction = layout.direction;
+    dyn_stack(
+        move || layout.panes.clone(),
+        pane_row_key,
+        move |pane| {
+            pane_view(
+                pane,
+                controller,
+                store.clone(),
+                shared_model.clone(),
+                notification_sink.clone(),
+            )
+        },
+    )
+    .style(move |s| {
+        let s = match direction {
+            PaneStackDirection::Row => s.flex_row(),
+            PaneStackDirection::Column => s.flex_col(),
+        };
+        s.width_full()
+            .height_full()
+            .min_height(0.0)
+            .gap(1.0)
+            .background(Color::rgb8(0x25, 0x2a, 0x32))
     })
 }
 
@@ -267,6 +342,7 @@ fn pane_view(
     controller: RwSignal<AppController>,
     store: Arc<SessionStore>,
     shared_model: SharedAppModel,
+    notification_sink: TerminalNotificationSink,
 ) -> impl IntoView {
     let pane_id = pane.id;
     let tab_shared_model = shared_model.clone();
@@ -274,7 +350,7 @@ fn pane_view(
     v_stack((
         dyn_stack(
             move || surface_tab_rows(controller, pane_id),
-            |tab| (tab.id, tab.label.clone(), tab.selected),
+            surface_tab_key,
             move |tab| {
                 surface_tab_button(
                     tab,
@@ -297,8 +373,10 @@ fn pane_view(
         }),
         dyn_stack(
             move || terminal_content_rows(controller, pane_id),
-            |content| (content.surface_id, content.available),
-            move |content| terminal_content_view(content, shared_model.clone()),
+            terminal_content_key,
+            move |content| {
+                terminal_content_view(content, shared_model.clone(), notification_sink.clone())
+            },
         )
         .style(|s| s.width_full().height_full().min_height(0.0)),
     ))
@@ -322,11 +400,16 @@ fn pane_view(
 fn terminal_content_view(
     content: TerminalContentRow,
     shared_model: SharedAppModel,
+    notification_sink: TerminalNotificationSink,
 ) -> impl IntoView {
     match content.entry {
-        Some(entry) => terminal_view_for_entry(Arc::new(entry), Some(shared_model))
-            .style(|s| s.width_full().height_full().min_height(0.0))
-            .into_any(),
+        Some(entry) => terminal_view_for_entry_with_notifications(
+            Arc::new(entry),
+            Some(shared_model),
+            Some(notification_sink),
+        )
+        .style(|s| s.width_full().height_full().min_height(0.0))
+        .into_any(),
         None => unavailable_terminal_view().into_any(),
     }
 }
@@ -351,7 +434,12 @@ fn workspace_row_button(
     let action = AppAction::SelectWorkspace(row.id);
     button(label(move || row.label.clone()).style(|s| s.text_ellipsis()))
         .action(move || {
-            dispatch_shell_action(controller, store.clone(), shared_model.clone(), action.clone());
+            dispatch_shell_action(
+                controller,
+                store.clone(),
+                shared_model.clone(),
+                action.clone(),
+            );
         })
         .style(move |s| {
             let background = if row.selected {
@@ -438,6 +526,18 @@ struct PaneRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PaneLayout {
+    direction: PaneStackDirection,
+    panes: Vec<PaneRow>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneStackDirection {
+    Row,
+    Column,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SurfaceTabRow {
     id: SurfaceId,
     label: String,
@@ -447,8 +547,23 @@ struct SurfaceTabRow {
 #[derive(Clone)]
 struct TerminalContentRow {
     surface_id: SurfaceId,
-    available: bool,
     entry: Option<TerminalEntry>,
+}
+
+fn workspace_row_key(row: &WorkspaceRow) -> WorkspaceId {
+    row.id
+}
+
+fn pane_row_key(row: &PaneRow) -> PaneId {
+    row.id
+}
+
+fn surface_tab_key(row: &SurfaceTabRow) -> SurfaceId {
+    row.id
+}
+
+fn terminal_content_key(row: &TerminalContentRow) -> SurfaceId {
+    row.surface_id
 }
 
 fn workspace_rows(controller: RwSignal<AppController>) -> Vec<WorkspaceRow> {
@@ -471,17 +586,40 @@ fn workspace_rows(controller: RwSignal<AppController>) -> Vec<WorkspaceRow> {
         .unwrap_or_default()
 }
 
-fn pane_rows(controller: RwSignal<AppController>) -> Vec<PaneRow> {
-    let controller = controller.get();
-    let Ok(workspace) = controller.model.selected_workspace() else {
-        return Vec::new();
-    };
+fn pane_layout(controller: RwSignal<AppController>) -> PaneLayout {
+    controller
+        .get()
+        .model
+        .selected_workspace()
+        .map(pane_layout_for_workspace)
+        .unwrap_or_else(|_| PaneLayout {
+            direction: PaneStackDirection::Column,
+            panes: Vec::new(),
+        })
+}
 
+fn pane_layout_for_workspace(workspace: &Workspace) -> PaneLayout {
     match workspace.layout {
-        SplitTree::Leaf(pane_id) => vec![pane_row(workspace, pane_id)],
-        SplitTree::Split { first, second, .. } => {
-            vec![pane_row(workspace, first), pane_row(workspace, second)]
-        }
+        SplitTree::Leaf(pane_id) => PaneLayout {
+            direction: PaneStackDirection::Column,
+            panes: vec![pane_row(workspace, pane_id)],
+        },
+        SplitTree::Split {
+            axis,
+            first,
+            second,
+            ..
+        } => PaneLayout {
+            direction: pane_stack_direction(axis),
+            panes: vec![pane_row(workspace, first), pane_row(workspace, second)],
+        },
+    }
+}
+
+fn pane_stack_direction(axis: SplitAxis) -> PaneStackDirection {
+    match axis {
+        SplitAxis::Vertical => PaneStackDirection::Row,
+        SplitAxis::Horizontal => PaneStackDirection::Column,
     }
 }
 
@@ -492,10 +630,7 @@ fn pane_row(workspace: &Workspace, pane_id: PaneId) -> PaneRow {
     }
 }
 
-fn surface_tab_rows(
-    controller: RwSignal<AppController>,
-    pane_id: PaneId,
-) -> Vec<SurfaceTabRow> {
+fn surface_tab_rows(controller: RwSignal<AppController>, pane_id: PaneId) -> Vec<SurfaceTabRow> {
     controller
         .get()
         .model
@@ -523,12 +658,10 @@ fn terminal_content_rows(
     let row = selected_terminal_entry(&controller, pane_id)
         .map(|(surface_id, entry)| TerminalContentRow {
             surface_id,
-            available: true,
             entry: Some(entry),
         })
         .unwrap_or_else(|| TerminalContentRow {
             surface_id: SurfaceId(0),
-            available: false,
             entry: None,
         });
 
@@ -603,6 +736,93 @@ mod tests {
 
         let loaded = store.load_model().unwrap().unwrap();
         assert_eq!(loaded.selected_workspace().unwrap().title, "Beta");
+    }
+
+    #[test]
+    fn terminal_notifications_update_controller_model_and_saved_session() {
+        let mut controller = AppController::new(AppModel::new("C:/work/alpha")).unwrap();
+        let surface_id = controller.model.selected_pane().unwrap().selected_surface;
+        let store = temp_session_store("terminal-notification-save");
+        let mut emulator = umux_terminal::TerminalEmulator::new(20, 3, 100);
+        let notifications = emulator.feed_bytes(b"\x1b]9;Build done\x07");
+
+        apply_terminal_notification_event(
+            &mut controller,
+            &store,
+            TerminalNotificationEvent {
+                surface_id,
+                notifications,
+            },
+        );
+
+        let workspace = controller.model.selected_workspace().unwrap();
+        assert!(workspace.unread);
+        assert_eq!(workspace.latest_notification.as_deref(), Some("Build done"));
+        assert_eq!(
+            controller
+                .model
+                .latest_unread_target
+                .as_ref()
+                .map(|target| target.surface_id),
+            Some(surface_id)
+        );
+        let loaded = store.load_model().unwrap().unwrap();
+        assert!(loaded.selected_workspace().unwrap().unread);
+        assert_eq!(
+            loaded
+                .latest_unread_target
+                .as_ref()
+                .map(|target| target.surface_id),
+            Some(surface_id)
+        );
+    }
+
+    #[test]
+    fn pane_layout_preserves_split_axis() {
+        let mut vertical = AppModel::new("C:/work/alpha");
+        vertical.split_selected_pane(SplitAxis::Vertical).unwrap();
+        let vertical_layout = pane_layout_for_workspace(vertical.selected_workspace().unwrap());
+
+        let mut horizontal = AppModel::new("C:/work/alpha");
+        horizontal
+            .split_selected_pane(SplitAxis::Horizontal)
+            .unwrap();
+        let horizontal_layout = pane_layout_for_workspace(horizontal.selected_workspace().unwrap());
+
+        assert_eq!(vertical_layout.direction, PaneStackDirection::Row);
+        assert_eq!(horizontal_layout.direction, PaneStackDirection::Column);
+        assert_eq!(vertical_layout.panes.len(), 2);
+        assert_eq!(horizontal_layout.panes.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_row_keys_ignore_label_and_selected_state() {
+        let workspace_before = WorkspaceRow {
+            id: WorkspaceId(10),
+            label: "alpha".to_string(),
+            selected: false,
+        };
+        let workspace_after = WorkspaceRow {
+            id: WorkspaceId(10),
+            label: "alpha *".to_string(),
+            selected: true,
+        };
+        let tab_before = SurfaceTabRow {
+            id: SurfaceId(20),
+            label: "Terminal".to_string(),
+            selected: false,
+        };
+        let tab_after = SurfaceTabRow {
+            id: SurfaceId(20),
+            label: "Terminal *".to_string(),
+            selected: true,
+        };
+
+        assert_eq!(
+            workspace_row_key(&workspace_before),
+            workspace_row_key(&workspace_after)
+        );
+        assert_eq!(surface_tab_key(&tab_before), surface_tab_key(&tab_after));
     }
 
     fn workspace(title: &str) -> Workspace {

@@ -12,9 +12,9 @@ use floem::ext_event::create_signal_from_channel;
 use floem::keyboard::{Key, Modifiers, NamedKey};
 use floem::prelude::*;
 use umux_app::TerminalEntry;
-use umux_core::{AppModel, PaneId, SurfaceId, WorkspaceId};
 #[cfg(test)]
 use umux_core::ModelError;
+use umux_core::{AppModel, PaneId, SurfaceId, WorkspaceId};
 #[cfg(windows)]
 use umux_terminal::{LiveTerminalSession, PtySpawnConfig, ShellResolver};
 use umux_terminal::{
@@ -208,6 +208,14 @@ impl TerminalLaunchContext {
 
 pub type SharedAppModel = Arc<Mutex<AppModel>>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TerminalNotificationEvent {
+    pub surface_id: SurfaceId,
+    pub notifications: Vec<TerminalNotification>,
+}
+
+pub(crate) type TerminalNotificationSink = Sender<TerminalNotificationEvent>;
+
 enum TerminalSessionSource {
     Internal(TerminalLaunchContext),
     External {
@@ -228,20 +236,33 @@ pub(crate) fn terminal_view_for_context(
     context: TerminalLaunchContext,
     model: Option<SharedAppModel>,
 ) -> impl IntoView {
-    terminal_view_for_source(TerminalSessionSource::Internal(context), model)
+    terminal_view_for_source(TerminalSessionSource::Internal(context), model, None)
 }
 
 pub fn terminal_view_for_entry(
     entry: Arc<TerminalEntry>,
     model: Option<SharedAppModel>,
 ) -> impl IntoView {
+    terminal_view_for_entry_with_notifications(entry, model, None)
+}
+
+pub(crate) fn terminal_view_for_entry_with_notifications(
+    entry: Arc<TerminalEntry>,
+    model: Option<SharedAppModel>,
+    notification_sink: Option<TerminalNotificationSink>,
+) -> impl IntoView {
     let context = TerminalLaunchContext::from_entry(&entry);
-    terminal_view_for_source(TerminalSessionSource::External { context, entry }, model)
+    terminal_view_for_source(
+        TerminalSessionSource::External { context, entry },
+        model,
+        notification_sink,
+    )
 }
 
 fn terminal_view_for_source(
     source: TerminalSessionSource,
     model: Option<SharedAppModel>,
+    notification_sink: Option<TerminalNotificationSink>,
 ) -> impl IntoView {
     let initial = TerminalUiState::initial("pwsh", "umux terminal MVP");
     let initial_status = initial.status.clone();
@@ -253,7 +274,7 @@ fn terminal_view_for_source(
     let dragging = create_rw_signal(false);
     let metrics = TerminalMetrics::new(8.0, 16.0);
 
-    let session = start_terminal_session_for_source(source, state_tx, model);
+    let session = start_terminal_session_for_source(source, state_tx, model, notification_sink);
     let session_for_key = session.clone();
     let session_for_grid_resize = session.clone();
     let grid_chrome = TerminalGridChrome::default();
@@ -386,13 +407,14 @@ fn start_terminal_session_for_source(
     source: TerminalSessionSource,
     state_tx: TerminalUiStateSink,
     model: Option<SharedAppModel>,
+    notification_sink: Option<TerminalNotificationSink>,
 ) -> Option<TerminalSessionHandle> {
     match source {
         TerminalSessionSource::Internal(context) => {
-            start_terminal_session(context, state_tx, model)
+            start_terminal_session(context, state_tx, model, notification_sink)
         }
         TerminalSessionSource::External { context, entry } => Some(
-            start_external_terminal_session(context, entry, state_tx, model),
+            start_external_terminal_session(context, entry, state_tx, model, notification_sink),
         ),
     }
 }
@@ -402,6 +424,7 @@ fn start_external_terminal_session(
     entry: Arc<TerminalEntry>,
     state_tx: TerminalUiStateSink,
     model: Option<SharedAppModel>,
+    notification_sink: Option<TerminalNotificationSink>,
 ) -> TerminalSessionHandle {
     let surface_id = context.surface_id;
     let _ = send_terminal_ui_state(&state_tx, initial_state_for_entry(&entry));
@@ -426,6 +449,7 @@ fn start_external_terminal_session(
             };
             let keep_running = apply_terminal_refresh_result(
                 &model,
+                &notification_sink,
                 surface_id,
                 controller.is_alive(),
                 controller.drain_notifications(),
@@ -477,6 +501,7 @@ fn start_terminal_session(
     context: TerminalLaunchContext,
     state_tx: TerminalUiStateSink,
     model: Option<SharedAppModel>,
+    notification_sink: Option<TerminalNotificationSink>,
 ) -> Option<TerminalSessionHandle> {
     let shell = ShellResolver::from_path().resolve();
     let env = context.startup_environment();
@@ -523,6 +548,7 @@ fn start_terminal_session(
             };
             let keep_running = apply_terminal_refresh_result(
                 &model,
+                &notification_sink,
                 surface_id,
                 controller.is_alive(),
                 controller.drain_notifications(),
@@ -559,6 +585,7 @@ fn start_terminal_session(
     _context: TerminalLaunchContext,
     state_tx: TerminalUiStateSink,
     _model: Option<SharedAppModel>,
+    _notification_sink: Option<TerminalNotificationSink>,
 ) -> Option<TerminalSessionHandle> {
     let _ = send_terminal_ui_state(
         &state_tx,
@@ -633,11 +660,21 @@ fn apply_terminal_notifications(
 
 fn apply_terminal_refresh_result(
     model: &Option<SharedAppModel>,
+    notification_sink: &Option<TerminalNotificationSink>,
     surface_id: SurfaceId,
     keep_running: bool,
     notifications: Vec<TerminalNotification>,
 ) -> bool {
-    if let Some(model) = model {
+    if notifications.is_empty() {
+        return keep_running;
+    }
+
+    if let Some(notification_sink) = notification_sink {
+        let _ = notification_sink.send(TerminalNotificationEvent {
+            surface_id,
+            notifications,
+        });
+    } else if let Some(model) = model {
         let mut model = model.lock().expect("app model lock poisoned");
         apply_terminal_notifications(&mut model, surface_id, notifications);
     }
@@ -979,8 +1016,13 @@ mod tests {
         let mut emulator = umux_terminal::TerminalEmulator::new(20, 3, 100);
         let notifications = emulator.feed_bytes(b"\x1b]9;done before exit\x07");
 
-        let keep_running =
-            apply_terminal_refresh_result(&Some(model.clone()), surface_id, false, notifications);
+        let keep_running = apply_terminal_refresh_result(
+            &Some(model.clone()),
+            &None,
+            surface_id,
+            false,
+            notifications,
+        );
 
         assert!(!keep_running);
         let model = model.lock().unwrap();
