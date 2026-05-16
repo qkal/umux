@@ -33,6 +33,10 @@ pub struct Surface {
     pub kind: SurfaceKind,
     pub title: String,
     pub unread: bool,
+    #[serde(default)]
+    pub unread_message: Option<String>,
+    #[serde(default)]
+    pub unread_sequence: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -360,6 +364,8 @@ impl AppModel {
             kind: SurfaceKind::Browser,
             title: url,
             unread: false,
+            unread_message: None,
+            unread_sequence: None,
         };
 
         let pane = self.selected_pane_mut()?;
@@ -435,6 +441,8 @@ impl AppModel {
         let surface = &mut workspace.panes[pane_index].surfaces[surface_index];
 
         surface.unread = true;
+        surface.unread_message = Some(message.clone());
+        surface.unread_sequence = Some(sequence);
         workspace.unread = true;
         workspace.latest_notification = Some(message.clone());
         self.latest_unread_target = Some(UnreadTarget {
@@ -455,6 +463,8 @@ impl AppModel {
         let workspace = &mut self.windows[window_index].workspaces[workspace_index];
         let surface = &mut workspace.panes[pane_index].surfaces[surface_index];
         surface.unread = false;
+        surface.unread_message = None;
+        surface.unread_sequence = None;
         recompute_workspace_unread(workspace);
         self.latest_unread_target = newest_unread_target(self);
         Ok(())
@@ -538,6 +548,8 @@ fn terminal_surface(id: SurfaceId) -> Surface {
         kind: SurfaceKind::Terminal,
         title: "Terminal".to_string(),
         unread: false,
+        unread_message: None,
+        unread_sequence: None,
     }
 }
 
@@ -556,28 +568,29 @@ fn newest_unread_target(app: &AppModel) -> Option<UnreadTarget> {
         .flat_map(|workspace| {
             workspace.panes.iter().flat_map(move |pane| {
                 pane.surfaces.iter().filter_map(move |surface| {
-                    surface.unread.then(|| UnreadTarget {
+                    surface.unread.then_some(UnreadTarget {
                         workspace_id: workspace.id,
                         pane_id: pane.id,
                         surface_id: surface.id,
-                        message: workspace.latest_notification.clone().unwrap_or_default(),
-                        sequence: 0,
+                        message: surface.unread_message.clone().unwrap_or_default(),
+                        sequence: surface.unread_sequence.unwrap_or_default(),
                     })
                 })
             })
         })
-        .next()
+        .max_by_key(|target| target.sequence)
 }
 
 fn recompute_workspace_unread(workspace: &mut Workspace) {
-    workspace.unread = workspace
+    let newest_unread = workspace
         .panes
         .iter()
         .flat_map(|pane| pane.surfaces.iter())
-        .any(|surface| surface.unread);
-    if !workspace.unread {
-        workspace.latest_notification = None;
-    }
+        .filter(|surface| surface.unread)
+        .max_by_key(|surface| surface.unread_sequence.unwrap_or_default());
+    workspace.unread = newest_unread.is_some();
+    workspace.latest_notification =
+        newest_unread.and_then(|surface| surface.unread_message.clone());
 }
 
 #[cfg(test)]
@@ -793,9 +806,15 @@ mod tests {
         assert_eq!(target.surface_id, surface_id);
         assert_eq!(target.message, "Build finished");
         assert_eq!(target.sequence, 1);
+        let surface = app.selected_pane().unwrap().surface(surface_id).unwrap();
+        assert_eq!(surface.unread_message, Some("Build finished".to_string()));
+        assert_eq!(surface.unread_sequence, Some(1));
 
         app.mark_surface_read(surface_id).unwrap();
         assert_eq!(app.latest_unread_target, None);
+        let surface = app.selected_pane().unwrap().surface(surface_id).unwrap();
+        assert_eq!(surface.unread_message, None);
+        assert_eq!(surface.unread_sequence, None);
         assert!(!app.selected_workspace().unwrap().unread);
     }
 
@@ -869,6 +888,52 @@ mod tests {
         let target = app.latest_unread_target.as_ref().unwrap();
         assert_eq!(target.surface_id, first);
         assert_ne!(target.surface_id, second);
+        assert_eq!(target.message, "First");
+        assert_eq!(target.sequence, 1);
+    }
+
+    #[test]
+    fn reading_latest_unread_target_falls_back_to_remaining_surface_metadata() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let first = app.selected_pane().unwrap().selected_surface;
+        let second = app.open_terminal_surface().unwrap();
+
+        app.mark_surface_unread(first, "First".to_string()).unwrap();
+        app.mark_surface_unread(second, "Second".to_string())
+            .unwrap();
+
+        app.mark_surface_read(second).unwrap();
+
+        let target = app.latest_unread_target.as_ref().unwrap();
+        assert_eq!(target.surface_id, first);
+        assert_eq!(target.message, "First");
+        assert_eq!(target.sequence, 1);
+        assert_eq!(
+            app.selected_workspace().unwrap().latest_notification,
+            Some("First".to_string())
+        );
+    }
+
+    #[test]
+    fn closing_pane_with_latest_notification_preserves_remaining_workspace_message() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let first_surface = app.selected_pane().unwrap().selected_surface;
+        let second_pane = app.split_selected_pane(SplitAxis::Vertical).unwrap();
+        let second_surface = app.selected_pane().unwrap().selected_surface;
+
+        app.mark_surface_unread(first_surface, "First".to_string())
+            .unwrap();
+        app.mark_surface_unread(second_surface, "Second".to_string())
+            .unwrap();
+        app.close_pane(second_pane).unwrap();
+
+        let workspace = app.selected_workspace().unwrap();
+        assert!(workspace.unread);
+        assert_eq!(workspace.latest_notification, Some("First".to_string()));
+        let target = app.latest_unread_target.as_ref().unwrap();
+        assert_eq!(target.surface_id, first_surface);
+        assert_eq!(target.message, "First");
+        assert_eq!(target.sequence, 1);
     }
 
     #[test]
@@ -891,5 +956,7 @@ mod tests {
         assert_eq!(target.workspace_id, alpha);
         assert_eq!(target.surface_id, alpha_surface);
         assert_ne!(target.surface_id, beta_surface);
+        assert_eq!(target.message, "Alpha");
+        assert_eq!(target.sequence, 1);
     }
 }
