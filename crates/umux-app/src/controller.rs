@@ -33,6 +33,10 @@ impl AppController {
         Ok(controller)
     }
 
+    pub fn from_restored_model(model: AppModel) -> Result<Self, AppControllerError> {
+        Self::new(model)
+    }
+
     pub fn apply(&mut self, action: AppAction) -> Result<AppActionOutcome, AppControllerError> {
         let before = self.selected_ids()?;
         let mut outcome = AppActionOutcome {
@@ -345,5 +349,18 @@ mod tests {
 
         assert!(save_now.should_save_session);
         assert!(select_workspace.should_save_session);
+    }
+
+    #[test]
+    fn controller_restore_spawns_restored_terminals() {
+        let mut model = AppModel::new("C:/work/alpha");
+        model
+            .create_workspace("C:/work/beta", Some("Beta".to_string()))
+            .unwrap();
+
+        let controller = AppController::from_restored_model(model).unwrap();
+
+        assert_eq!(controller.terminals.len(), 2);
+        assert_eq!(controller.model.selected_workspace().unwrap().title, "Beta");
     }
 }
