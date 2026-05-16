@@ -3556,6 +3556,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "umux-app",
+ "umux-config",
  "umux-core",
  "umux-terminal",
 ]
