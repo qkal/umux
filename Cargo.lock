@@ -3465,6 +3465,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "floem",
+ "floem_renderer",
  "umux-app",
  "umux-core",
  "umux-terminal",

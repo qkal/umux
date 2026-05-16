@@ -24,6 +24,8 @@ The new renderer should consume `TerminalRendererSnapshot` and paint the visible
 
 The existing per-cell renderer should remain available as a fallback during rollout. Keeping the fallback reduces implementation risk and makes it easier to compare behavior while the painted renderer is verified.
 
+The rollout switch should be concrete and observable. Use `UMUX_TERMINAL_RENDERER=painted|legacy`, defaulting to `painted` after the new renderer is wired. The legacy value must force the old per-cell path so bug reports can quickly separate painter issues from terminal engine issues.
+
 ## Rejected Approaches
 
 ### Refresh Loop Tuning Only
@@ -52,6 +54,13 @@ TerminalMetrics
 
 and produce a painted terminal grid view.
 
+Internally, the boundary should split into two parts:
+
+1. a pure frame preparation layer that converts a snapshot, selection, and metrics into draw commands
+2. a Floem custom view that stores the latest prepared frame and paints it
+
+The custom view must follow Floem's explicit state-update model. Reactive effects should observe the terminal UI state and selection signals, call `ViewId::update_state` with the latest prepared frame, and the view's `update` method should request paint or layout as appropriate. The view must not rely on reading reactive signals directly inside `paint`.
+
 The following behavior should remain owned by the existing code:
 
 - terminal session startup and shutdown
@@ -66,18 +75,24 @@ The following behavior should remain owned by the existing code:
 
 The first implementation should preserve the current fixed `TerminalMetrics` values: 8 px cell width and 16 px cell height.
 
+The painted grid should fill the available terminal viewport owned by the existing terminal view. Its layout must not shrink to only the current `cols * cell_width` by `rows * cell_height` content size, because the resize handler depends on the viewport size to compute terminal grid dimensions. Terminal resize math should continue to run at the same boundary that currently receives the grid view's resize events.
+
 The painted view should:
 
 - paint the terminal background for the whole content area
 - paint non-default cell backgrounds as horizontal runs where possible
 - paint selection backgrounds over selected cells
 - paint the cursor using the existing cursor color behavior
-- paint text row-by-row or run-by-run using Floem text layout APIs
-- use `TerminalCell` foreground, background, and style fields as the source of truth
+- paint text as fixed-cell runs using Floem text layout APIs
+- use `TerminalCell` foreground, background, and supported style fields as the source of truth
 - use `TerminalRendererSnapshot::version` as the primary content invalidation signal
 - request repaint when snapshot version, grid size, cursor, or selection changes
 
-The first pass does not need to implement font measurement, ligatures, advanced shaping, scrollback viewporting, terminal images, GPU-specific batching, or terminal protocol upgrades.
+Text placement should preserve terminal grid geometry. Every text run should carry its row and starting column. Paint each run at `x = start_col * cell_width` and `y = row * cell_height` with a stable baseline offset, rather than letting a full-row text layout decide all column positions. This prevents proportional glyph advance, fallback font metrics, or layout rounding from drifting away from terminal cell coordinates.
+
+The first pass should preserve current behavior for style fields that the legacy renderer currently ignores. If `bold`, `italic`, `underline`, or `inverse` are implemented in the painted renderer, add tests for them. If they are not implemented in the first pass, document that as legacy parity and ensure the fallback remains available. The painter must still consume foreground and background colors, cursor state, and selection state correctly.
+
+The first pass does not need to implement font measurement, ligatures, advanced shaping, scrollback viewporting, terminal images, GPU-specific batching, or terminal protocol upgrades. Wide glyphs, combining marks, and non-ASCII glyphs should not be treated as solved by the first pass unless explicitly tested. For rollout, the painter may preserve current one-cell-per-`char` snapshot behavior and use the legacy renderer as the escape hatch for any unsupported text shaping issue.
 
 ## Data Flow
 
@@ -88,6 +103,9 @@ ConPTY / shell output
   -> umux-terminal emulator
   -> TerminalRendererSnapshot
   -> TerminalUiState channel
+  -> umux-ui signal
+  -> prepared terminal draw frame
+  -> Floem custom view state update
   -> painted umux-ui terminal grid
 ```
 
@@ -102,6 +120,8 @@ Floem key event
   -> painted terminal grid repaint
 ```
 
+Selection-only changes must also repaint the grid. Dragging a selection changes `TerminalSelection` without changing `TerminalRendererSnapshot::version`, so the draw-frame preparation key must include selection, cursor, grid size, and metrics in addition to the snapshot version.
+
 This keeps the terminal behavior familiar while removing the large per-cell view churn from the display path.
 
 ## Reliability Requirements
@@ -109,6 +129,7 @@ This keeps the terminal behavior familiar while removing the large per-cell view
 The implementation should be incremental and reversible:
 
 - keep the old per-cell renderer callable as a fallback
+- route fallback selection through `UMUX_TERMINAL_RENDERER=painted|legacy`
 - keep terminal engine, app controller, model, session store, and terminal registry unchanged
 - avoid behavior changes to terminal input, paste, copy, selection, resize, notifications, panes, tabs, and restore
 - keep terminal spawn failures rendering through a snapshot-like visible terminal frame
@@ -128,12 +149,17 @@ Automated tests should cover:
 
 - snapshot-to-draw-run conversion
 - text run grouping across simple rows
+- fixed-cell text run coordinates, including non-zero starting columns
 - background run grouping for repeated colors
 - selection background decisions
 - cursor foreground/background decisions
+- selection-only repaint/frame changes when snapshot version is unchanged
+- draw-frame invalidation when grid size, cursor, or metrics change
+- legacy parity for bold, italic, underline, and inverse if they remain unimplemented
 - zero-column and short-cell snapshots
 - resize math remaining unchanged
 - state coalescing continuing to keep the newest terminal snapshot
+- renderer mode parsing for painted and legacy fallback values
 
 Existing relevant tests should continue to pass for:
 
@@ -148,12 +174,13 @@ Manual smoke should include:
 - `cargo run -p umux` launches the app
 - `dir` renders readable output without obvious stutter
 - `cargo --version` renders promptly
-- a noisier output command remains responsive
+- a repeatable noisy output command remains responsive, for example a loop that prints at least 1,000 lines
 - typing still echoes promptly enough
 - drag selection and copy still work
 - paste still writes to the terminal
 - resizing the terminal still sends sane grid dimensions
 - tabs, panes, workspace switching, and restore still work
+- `$env:UMUX_TERMINAL_RENDERER='legacy'; cargo run -p umux` launches with the old renderer on Windows PowerShell
 
 Required checks before implementation completion:
 
@@ -166,12 +193,12 @@ Required checks before implementation completion:
 
 The repair is complete when:
 
-- command output stutter is noticeably reduced compared with the current renderer
+- command output stutter is noticeably reduced compared with the current renderer on the manual noisy-output smoke
 - typing echo is not worse and ideally feels more immediate
-- normal terminal rendering no longer creates a child Floem view for every visible cell
+- normal terminal rendering no longer creates a child Floem view for every visible cell; the normal path uses one painted grid view plus the surrounding terminal chrome
 - cursor, selection, foreground colors, background colors, and failure text render correctly
 - terminal input, paste, copy, resize, notifications, tabs, panes, workspace switching, and restore remain functional
-- the fallback renderer is still available during rollout
+- the fallback renderer is still available during rollout through `UMUX_TERMINAL_RENDERER=legacy`
 - automated checks and a manual launch smoke pass
 
 ## Out Of Scope
@@ -194,14 +221,15 @@ The implementation plan should start by extracting the existing cell renderer be
 Suggested implementation slices:
 
 1. Extract and preserve the existing per-cell renderer as fallback.
-2. Add terminal draw-frame/run data structures and tests.
-3. Add the custom Floem painted grid view.
-4. Route normal terminal rendering through the painted grid while preserving input, pointer, resize, and clipboard handling at the existing boundary.
-5. Run tests, launch smoke, and compare output burst behavior.
+2. Add renderer mode parsing for `UMUX_TERMINAL_RENDERER=painted|legacy`.
+3. Add terminal draw-frame/run data structures and tests.
+4. Add the custom Floem painted grid view with explicit `ViewId::update_state` reactivity.
+5. Route normal terminal rendering through the painted grid while preserving input, pointer, resize, and clipboard handling at the existing boundary.
+6. Run tests, launch smoke in both renderer modes, and compare output burst behavior.
 
 ## Spec Self-Review
 
 - Placeholder scan: no placeholder markers remain.
 - Internal consistency: the design consistently targets the UI renderer while preserving terminal engine and app workflow behavior.
 - Scope check: the work is focused enough for one implementation plan because engine rewrites, app redesign, browser surfaces, IPC, and terminal parity upgrades are explicitly out of scope.
-- Ambiguity check: renderer boundary, fallback requirement, testing expectations, and acceptance criteria are explicit enough to plan implementation without guessing.
+- Ambiguity check: renderer boundary, fallback requirement, Floem reactivity, viewport layout, text coordinates, testing expectations, and acceptance criteria are explicit enough to plan implementation without guessing.

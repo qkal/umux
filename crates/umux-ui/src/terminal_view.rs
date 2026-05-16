@@ -5,12 +5,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::terminal_canvas::{
+    TerminalRendererMode, prepare_terminal_draw_frame, terminal_painted_grid,
+};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
-use floem::Clipboard;
 use floem::event::{Event, EventListener, EventPropagation};
 use floem::ext_event::create_signal_from_channel;
 use floem::keyboard::{Key, Modifiers, NamedKey};
 use floem::prelude::*;
+use floem::reactive::{ReadSignal, RwSignal};
+use floem::{AnyView, Clipboard};
 use umux_app::TerminalEntry;
 #[cfg(test)]
 use umux_core::ModelError;
@@ -281,79 +285,69 @@ fn terminal_view_for_source(
     let session_for_key = session.clone();
     let session_for_grid_resize = session.clone();
     let grid_chrome = TerminalGridChrome::default();
-    let grid = dyn_stack(
-        move || {
-            let snapshot = state
-                .get()
-                .map(|state| state.snapshot)
-                .unwrap_or_else(|| initial_snapshot.clone());
-            render_rows(snapshot_with_selection(snapshot, selection.get()))
-        },
-        |row| row.key.clone(),
-        move |row| {
-            h_stack_from_iter(row.cells.into_iter().map(render_cell_view))
-                .style(move |s| s.height(metrics.cell_height_px() as f64))
-        },
-    )
-    .on_event_stop(EventListener::PointerDown, move |event| {
-        let Event::PointerDown(event) = event else {
-            return;
-        };
-        if !event.button.is_primary() {
-            return;
-        }
-        let Some((col, row)) = pointer_to_grid_cell(event.pos.x, event.pos.y, metrics, grid_chrome)
-        else {
-            return;
-        };
-        dragging.set(true);
-        selection.set(Some(TerminalSelection {
-            start_col: col,
-            start_row: row,
-            end_col: col,
-            end_row: row,
-        }));
-    })
-    .on_event_stop(EventListener::PointerMove, move |event| {
-        if !dragging.get_untracked() {
-            return;
-        }
-        let Event::PointerMove(event) = event else {
-            return;
-        };
-        let Some((col, row)) = pointer_to_grid_cell(event.pos.x, event.pos.y, metrics, grid_chrome)
-        else {
-            return;
-        };
-        if let Some(mut current) = selection.get_untracked() {
-            current.end_col = col;
-            current.end_row = row;
-            selection.set(Some(current));
-        }
-    })
-    .on_resize(move |rect| {
-        let Some(session) = &session_for_grid_resize else {
-            return;
-        };
-        let size =
-            terminal_grid_size_for_viewport(metrics, rect.width() as f32, rect.height() as f32);
-        session.resize(size.cols, size.rows);
-    })
-    .on_event_stop(EventListener::PointerUp, move |event| {
-        dragging.set(false);
-        let Event::PointerUp(event) = event else {
-            return;
-        };
-        let Some((col, row)) = pointer_to_grid_cell(event.pos.x, event.pos.y, metrics, grid_chrome)
-        else {
-            return;
-        };
-        if let Some(mut current) = selection.get_untracked() {
-            current.end_col = col;
-            current.end_row = row;
-            selection.set(Some(current));
-        }
-    });
+    let grid = terminal_grid_view(state, initial_snapshot, selection, metrics)
+        .on_event_stop(EventListener::PointerDown, move |event| {
+            let Event::PointerDown(event) = event else {
+                return;
+            };
+            if !event.button.is_primary() {
+                return;
+            }
+            let Some((col, row)) =
+                pointer_to_grid_cell(event.pos.x, event.pos.y, metrics, grid_chrome)
+            else {
+                return;
+            };
+            dragging.set(true);
+            selection.set(Some(TerminalSelection {
+                start_col: col,
+                start_row: row,
+                end_col: col,
+                end_row: row,
+            }));
+        })
+        .on_event_stop(EventListener::PointerMove, move |event| {
+            if !dragging.get_untracked() {
+                return;
+            }
+            let Event::PointerMove(event) = event else {
+                return;
+            };
+            let Some((col, row)) =
+                pointer_to_grid_cell(event.pos.x, event.pos.y, metrics, grid_chrome)
+            else {
+                return;
+            };
+            if let Some(mut current) = selection.get_untracked() {
+                current.end_col = col;
+                current.end_row = row;
+                selection.set(Some(current));
+            }
+        })
+        .on_resize(move |rect| {
+            let Some(session) = &session_for_grid_resize else {
+                return;
+            };
+            let size =
+                terminal_grid_size_for_viewport(metrics, rect.width() as f32, rect.height() as f32);
+            session.resize(size.cols, size.rows);
+        })
+        .on_event_stop(EventListener::PointerUp, move |event| {
+            dragging.set(false);
+            let Event::PointerUp(event) = event else {
+                return;
+            };
+            let Some((col, row)) =
+                pointer_to_grid_cell(event.pos.x, event.pos.y, metrics, grid_chrome)
+            else {
+                return;
+            };
+            if let Some(mut current) = selection.get_untracked() {
+                current.end_col = col;
+                current.end_row = row;
+                selection.set(Some(current));
+            }
+        });
 
     v_stack((
         label(move || {
@@ -404,6 +398,65 @@ fn terminal_view_for_source(
             .background(TERMINAL_BG)
             .font_family("Cascadia Mono".to_string())
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalGridRenderer {
+    Painted,
+    Legacy,
+}
+
+fn terminal_grid_renderer_for_mode(mode: TerminalRendererMode) -> TerminalGridRenderer {
+    match mode {
+        TerminalRendererMode::Painted => TerminalGridRenderer::Painted,
+        TerminalRendererMode::Legacy => TerminalGridRenderer::Legacy,
+    }
+}
+
+fn terminal_grid_view(
+    state: ReadSignal<Option<TerminalUiState>>,
+    initial_snapshot: TerminalRendererSnapshot,
+    selection: RwSignal<Option<TerminalSelection>>,
+    metrics: TerminalMetrics,
+) -> AnyView {
+    match terminal_grid_renderer_for_mode(TerminalRendererMode::current()) {
+        TerminalGridRenderer::Painted => terminal_painted_grid(move || {
+            let snapshot = state
+                .get()
+                .map(|state| state.snapshot)
+                .unwrap_or_else(|| initial_snapshot.clone());
+            prepare_terminal_draw_frame(snapshot_with_selection(snapshot, selection.get()), metrics)
+        })
+        .style(|s| s.width_full().height_full())
+        .into_any(),
+        TerminalGridRenderer::Legacy => {
+            legacy_terminal_grid(state, initial_snapshot, selection, metrics)
+                .style(|s| s.width_full().height_full())
+                .into_any()
+        }
+    }
+}
+
+fn legacy_terminal_grid(
+    state: ReadSignal<Option<TerminalUiState>>,
+    initial_snapshot: TerminalRendererSnapshot,
+    selection: RwSignal<Option<TerminalSelection>>,
+    metrics: TerminalMetrics,
+) -> impl IntoView {
+    dyn_stack(
+        move || {
+            let snapshot = state
+                .get()
+                .map(|state| state.snapshot)
+                .unwrap_or_else(|| initial_snapshot.clone());
+            render_rows(snapshot_with_selection(snapshot, selection.get()))
+        },
+        |row| row.key.clone(),
+        move |row| {
+            h_stack_from_iter(row.cells.into_iter().map(render_cell_view))
+                .style(move |s| s.height(metrics.cell_height_px() as f64))
+        },
+    )
 }
 
 fn start_terminal_session_for_source(
@@ -1093,5 +1146,17 @@ mod tests {
             Some("second")
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_renderer_mode_selects_expected_grid_path() {
+        assert_eq!(
+            terminal_grid_renderer_for_mode(crate::terminal_canvas::TerminalRendererMode::Legacy),
+            TerminalGridRenderer::Legacy
+        );
+        assert_eq!(
+            terminal_grid_renderer_for_mode(crate::terminal_canvas::TerminalRendererMode::Painted),
+            TerminalGridRenderer::Painted
+        );
     }
 }
