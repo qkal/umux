@@ -131,6 +131,7 @@ impl AppSnapshot {
                     panes[0].id
                 };
                 let layout = reconcile_layout(workspace.layout, &panes);
+                let (unread, latest_notification) = workspace_unread_state(&panes);
 
                 workspaces.push(Workspace {
                     id: workspace.id.into(),
@@ -139,8 +140,8 @@ impl AppSnapshot {
                     panes,
                     selected_pane,
                     layout,
-                    unread: workspace.unread,
-                    latest_notification: workspace.latest_notification,
+                    unread,
+                    latest_notification,
                 });
             }
 
@@ -586,6 +587,19 @@ fn existing_pane_id(id: CorePaneId, panes: &[Pane]) -> Option<CorePaneId> {
     panes.iter().any(|pane| pane.id == id).then_some(id)
 }
 
+fn workspace_unread_state(panes: &[Pane]) -> (bool, Option<String>) {
+    let newest_unread = panes
+        .iter()
+        .flat_map(|pane| pane.surfaces.iter())
+        .filter(|surface| surface.unread)
+        .max_by_key(|surface| surface.unread_sequence.unwrap_or_default());
+
+    (
+        newest_unread.is_some(),
+        newest_unread.and_then(|surface| surface.unread_message.clone()),
+    )
+}
+
 fn newest_unread_target(windows: &[AppWindow]) -> Option<CoreUnreadTarget> {
     windows
         .iter()
@@ -928,6 +942,8 @@ mod tests {
         assert_eq!(target.message, "Newer");
         assert_eq!(target.sequence, 3);
         assert_eq!(restored.next_unread_sequence, 4);
+        let workspace = restored.selected_workspace().unwrap();
+        assert_eq!(workspace.latest_notification, Some("Newer".to_string()));
     }
 
     #[test]
@@ -964,6 +980,60 @@ mod tests {
         let fallback = restored.latest_unread_target.as_ref().unwrap();
         assert_eq!(fallback.surface_id, first);
         assert_eq!(fallback.sequence, 1);
+    }
+
+    #[test]
+    fn restore_recomputes_workspace_unread_when_snapshot_state_is_stale() {
+        let json = r#"{
+  "schema_version": 2,
+  "selected_window": 1,
+  "latest_unread_target": null,
+  "next_unread_sequence": 1,
+  "windows": [
+    {
+      "id": 1,
+      "selected_workspace": 2,
+      "workspaces": [
+        {
+          "id": 2,
+          "title": "alpha",
+          "cwd": "C:/work/alpha",
+          "selected_pane": 3,
+          "layout": { "type": "leaf", "pane": 3 },
+          "unread": true,
+          "latest_notification": "Stale",
+          "panes": [
+            {
+              "id": 3,
+              "cwd": "C:/work/alpha",
+              "selected_surface": 4,
+              "surfaces": [
+                {
+                  "id": 4,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": false,
+                  "unread_message": null,
+                  "unread_sequence": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}"#;
+
+        let restored = AppSnapshot::from_json_str(json)
+            .unwrap()
+            .into_model()
+            .unwrap();
+        let workspace = restored.selected_workspace().unwrap();
+
+        assert!(!workspace.unread);
+        assert_eq!(workspace.latest_notification, None);
+        assert_eq!(restored.latest_unread_target, None);
     }
 
     #[test]
