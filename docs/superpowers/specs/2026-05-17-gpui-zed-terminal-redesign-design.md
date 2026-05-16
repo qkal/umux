@@ -42,7 +42,7 @@ Vendor GPUI runtime/platform crates and build a small `umux` UI kit inspired by 
 
 ```text
 vendor/gpui/*
-vendor/umux-ui-kit/*
+crates/umux-ui-kit
         |
         v
 crates/umux-ui  -> terminal-first GPUI workspace
@@ -133,6 +133,27 @@ vendor/
 ```
 
 Add only the GPUI crates required for the Windows build, plus any small support crates proven necessary by compilation. Zed UI/workspace/editor/project crates should remain reference material unless a later design explicitly approves copying a narrow piece.
+
+## Vendoring Dependency Closure
+
+The vendoring work must start with a dependency-closure spike, not a hand-copied crate list. Zed's GPUI crates rely on non-GPUI Zed workspace crates in addition to registry dependencies. Examples visible in the local `zed/` checkout include `collections`, `http_client`, `scheduler`, `sum_tree`, and `util_macros`.
+
+The first implementation slice should:
+
+- derive the required path dependency closure from `zed/Cargo.toml` and the GPUI crate manifests
+- vendor or replace each required Zed support crate intentionally
+- keep registry crates as registry dependencies when they are not Zed-specific
+- pin the copied source to a Zed commit or local checkout revision
+- add a `vendor/gpui/README.md` or equivalent manifest that records source path, source revision, license, and any local modifications for every copied crate
+- build a minimal GPUI window before changing `crates/umux-ui`
+
+The GPUI vendoring slice is complete only when a minimal Windows GPUI window compiles and launches from this workspace without depending on `zed/` by path.
+
+## License And Provenance
+
+`umux` is GPL-3.0-or-later. Zed's terminal crate is also GPL-3.0-or-later, so copied terminal backend code is license-compatible with this repository. GPUI crates are Apache-2.0, so vendoring them is also compatible, but copied files must retain their original copyright and license notices.
+
+Every copied or adapted Zed file should keep its SPDX/license header where present. If a file is substantially rewritten rather than copied verbatim, the new file should still document the original source path and revision in a short module comment or in the vendor manifest. This should be part of the first vendoring and backend-grafting slices, not postponed until release.
 
 ## Zed Inspiration Map
 
@@ -304,6 +325,10 @@ TerminalSurface
     context menu state
     rename state
     bridge handle
+  observes:
+    TerminalEntry from AppController.TerminalRegistry
+  does not own:
+    live terminal session spawning or removal
 
 UmuxTerminalElement
   owns:
@@ -342,6 +367,8 @@ First milestone terminal behavior should include:
 - scrollback scrollbar
 - split/new terminal controls in the tab bar
 - custom GPUI terminal element with batched painting
+
+Inline terminal rename requires a model/controller slice. `Surface` already has a persisted `title`, but the current controller exposes `RenameWorkspace` only. Milestone one should add a `RenameSurface` action and model method so terminal tab renames persist through session save/restore instead of living only in GPUI view state.
 
 Later milestones can add terminal search, task/rerun status, breadcrumbs, hyperlink hover/tooltips, richer settings, and deeper backend convergence.
 
@@ -446,6 +473,28 @@ Keep or rewrite in umux when Zed code depends heavily on:
 
 The long-term target is a Zed-like terminal backend, not merely a Zed-like view. The short-term path is controlled grafting with tests.
 
+The existing `TerminalRegistry` owns live terminal sessions today. GPUI `TerminalSurface` should initially subscribe to or poll `TerminalEntry` snapshots from that registry. It must not spawn a second session for the same `SurfaceId`. If the backend later converges toward Zed's `TerminalBuilder` / `EventLoop` model, that should be done by changing `TerminalRegistry` and `umux-terminal` first, then letting GPUI consume the same registry-owned entries.
+
+Zed's terminal backend also expects GPUI window context for details such as `window_id` when creating Alacritty PTYs. That is another reason to graft backend pieces after the GPUI shell exists rather than copying the full terminal backend before runtime migration.
+
+## Surface Compatibility
+
+The model already supports `SurfaceKind::Browser`, and saved sessions may contain browser surfaces even though milestone one is terminal-first. The GPUI migration must not panic or discard these surfaces.
+
+Milestone one should render any non-terminal surface as a compact unsupported-surface placeholder tab/pane that preserves the surface title, kind, unread state, and close/select behavior. Creating new browser surfaces and hosting a real WebView can remain out of scope.
+
+## Floem Exit Criteria
+
+The migration is only "fully GPUI" when Floem is gone from the runtime build:
+
+- `crates/umux-ui` no longer imports `floem` or `floem_renderer`
+- workspace dependencies remove `floem` and `floem_renderer` unless another non-runtime tool still requires them
+- `apps/umux` launches through GPUI
+- `rg "floem" apps crates` finds no runtime references
+- the old Floem shell is removed or kept only in a clearly non-built reference branch, not behind a permanent runtime fallback
+
+During implementation, temporary fallback branches are acceptable for comparison, but the accepted milestone-one state should not keep two UI runtimes alive.
+
 ## Milestone 1: GPUI Terminal Workspace
 
 Goal: `umux` launches on GPUI and is usable as a terminal-first workspace.
@@ -453,6 +502,8 @@ Goal: `umux` launches on GPUI and is usable as a terminal-first workspace.
 Includes:
 
 - vendored GPUI runtime/platform crates
+- vendored GPUI support dependency closure with provenance manifest
+- minimal GPUI window compiling and launching from this workspace
 - small `umux-ui-kit` with theme, buttons, tabs, icon buttons
 - GPUI app launch replacing Floem launch
 - `UmuxWorkspace` entity owning `AppController` and `SessionStore`
@@ -465,8 +516,11 @@ Includes:
 - jump latest unread
 - GPUI `TerminalSurface` and `UmuxTerminalElement`
 - terminal typing, resize, selection, copy, paste
+- persisted terminal tab rename through `RenameSurface`
 - unread notification propagation
+- unsupported placeholder rendering for restored non-terminal surfaces
 - session restore/save
+- removal of Floem from the runtime build
 
 Not included:
 
@@ -562,9 +616,11 @@ Manual smoke should include:
 
 - Keep `umux-core`, `umux-app`, and `umux-terminal` stable while replacing the UI shell.
 - Vendor GPUI in an explicit directory and document copied source provenance.
+- Treat GPUI vendoring as a dependency-closure task, including required Zed support crates.
 - Copy Zed terminal backend pieces in small, tested slices.
 - Avoid importing Zed workspace, editor, and project crates.
 - Keep the old Floem code available as a temporary branch/reference during implementation, but do not keep Floem as a permanent runtime path.
+- Keep `TerminalRegistry` as the initial live-session owner to avoid double-spawning terminals.
 - Build after each meaningful migration slice.
 
 ## Open Follow-Ups
@@ -574,6 +630,5 @@ These are intentionally deferred beyond this design:
 - exact vendored GPUI crate list after compilation proves dependencies
 - file-level implementation plan
 - whether arbitrary nested split trees should be part of milestone one
-- exact provenance format for copied Zed code
 - terminal settings schema
 - command palette design
