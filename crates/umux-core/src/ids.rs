@@ -26,6 +26,14 @@ impl IdGen {
         Self::default()
     }
 
+    pub fn from_next_id(next_id: u64) -> Self {
+        Self { next_id }
+    }
+
+    pub fn advance_past(&mut self, id: u64) {
+        self.next_id = self.next_id.max(id);
+    }
+
     pub fn next_window(&mut self) -> WindowId {
         WindowId(self.next())
     }
@@ -45,5 +53,31 @@ impl IdGen {
     fn next(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IdGen;
+
+    #[test]
+    fn id_gen_can_advance_past_restored_ids() {
+        let mut ids = IdGen::new();
+
+        ids.advance_past(42);
+
+        assert_eq!(ids.next_window().0, 43);
+        assert_eq!(ids.next_workspace().0, 44);
+    }
+
+    #[test]
+    fn id_gen_does_not_rewind_when_advancing_past_lower_id() {
+        let mut ids = IdGen::new();
+        assert_eq!(ids.next_surface().0, 1);
+
+        ids.advance_past(1);
+        ids.advance_past(0);
+
+        assert_eq!(ids.next_surface().0, 2);
     }
 }

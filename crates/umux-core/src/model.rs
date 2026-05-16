@@ -36,6 +36,15 @@ pub struct Surface {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UnreadTarget {
+    pub workspace_id: WorkspaceId,
+    pub pane_id: PaneId,
+    pub surface_id: SurfaceId,
+    pub message: String,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Pane {
     pub id: PaneId,
     pub cwd: String,
@@ -115,6 +124,8 @@ pub struct AppModel {
     pub ids: IdGen,
     pub windows: Vec<AppWindow>,
     pub selected_window: WindowId,
+    pub latest_unread_target: Option<UnreadTarget>,
+    pub next_unread_sequence: u64,
 }
 
 impl AppModel {
@@ -154,6 +165,8 @@ impl AppModel {
             ids,
             windows: vec![window],
             selected_window: window_id,
+            latest_unread_target: None,
+            next_unread_sequence: 1,
         }
     }
 
@@ -193,6 +206,114 @@ impl AppModel {
         self.selected_workspace_mut()?
             .selected_pane_mut()
             .ok_or(ModelError::NoSelectedPane)
+    }
+
+    pub fn create_workspace(
+        &mut self,
+        cwd: impl Into<String>,
+        title: Option<String>,
+    ) -> Result<WorkspaceId, ModelError> {
+        let cwd = cwd.into();
+        let workspace_id = self.ids.next_workspace();
+        let pane_id = self.ids.next_pane();
+        let surface_id = self.ids.next_surface();
+        let workspace = Workspace {
+            id: workspace_id,
+            title: title.unwrap_or_else(|| workspace_title(&cwd)),
+            cwd: cwd.clone(),
+            panes: vec![Pane {
+                id: pane_id,
+                cwd,
+                surfaces: vec![terminal_surface(surface_id)],
+                selected_surface: surface_id,
+            }],
+            selected_pane: pane_id,
+            layout: SplitTree::Leaf(pane_id),
+            unread: false,
+            latest_notification: None,
+        };
+
+        let window = self.selected_window_mut()?;
+        window.workspaces.push(workspace);
+        window.selected_workspace = workspace_id;
+        Ok(workspace_id)
+    }
+
+    pub fn select_workspace(&mut self, workspace_id: WorkspaceId) -> Result<(), ModelError> {
+        let window = self.selected_window_mut()?;
+        if window.workspace(workspace_id).is_none() {
+            return Err(ModelError::UnknownWorkspace(workspace_id));
+        }
+        window.selected_workspace = workspace_id;
+        Ok(())
+    }
+
+    pub fn rename_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        title: String,
+    ) -> Result<(), ModelError> {
+        let workspace = self
+            .selected_window_mut()?
+            .workspace_mut(workspace_id)
+            .ok_or(ModelError::UnknownWorkspace(workspace_id))?;
+        workspace.title = title;
+        Ok(())
+    }
+
+    pub fn close_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<SurfaceId>, ModelError> {
+        let window = self.selected_window_mut()?;
+        if window.workspaces.len() == 1 {
+            return Err(ModelError::CannotCloseLastWorkspace);
+        }
+        let index = window
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+            .ok_or(ModelError::UnknownWorkspace(workspace_id))?;
+        let removed = window.workspaces.remove(index);
+        let removed_surfaces = workspace_surface_ids(&removed);
+        if window.selected_workspace == workspace_id {
+            let next_index = index.saturating_sub(1).min(window.workspaces.len() - 1);
+            window.selected_workspace = window.workspaces[next_index].id;
+        }
+        self.clear_unread_target_if_removed(&removed_surfaces);
+        Ok(removed_surfaces)
+    }
+
+    pub fn select_pane(&mut self, pane_id: PaneId) -> Result<(), ModelError> {
+        let workspace = self.selected_workspace_mut()?;
+        if workspace.pane(pane_id).is_none() {
+            return Err(ModelError::UnknownPane(pane_id));
+        }
+        workspace.selected_pane = pane_id;
+        Ok(())
+    }
+
+    pub fn close_pane(&mut self, pane_id: PaneId) -> Result<Vec<SurfaceId>, ModelError> {
+        let workspace = self.selected_workspace_mut()?;
+        if workspace.panes.len() == 1 {
+            return Err(ModelError::CannotCloseLastPane);
+        }
+        let index = workspace
+            .panes
+            .iter()
+            .position(|pane| pane.id == pane_id)
+            .ok_or(ModelError::UnknownPane(pane_id))?;
+        let removed = workspace.panes.remove(index);
+        let removed_surfaces = removed
+            .surfaces
+            .iter()
+            .map(|surface| surface.id)
+            .collect::<Vec<_>>();
+        let remaining = workspace.panes[0].id;
+        workspace.selected_pane = remaining;
+        workspace.layout = SplitTree::Leaf(remaining);
+        self.clear_unread_target_if_removed(&removed_surfaces);
+        Ok(removed_surfaces)
     }
 
     pub fn split_selected_pane(&mut self, axis: SplitAxis) -> Result<PaneId, ModelError> {
@@ -244,23 +365,124 @@ impl AppModel {
         Ok(surface_id)
     }
 
+    pub fn open_terminal_surface(&mut self) -> Result<SurfaceId, ModelError> {
+        let surface_id = self.ids.next_surface();
+        let pane = self.selected_pane_mut()?;
+        pane.surfaces.push(terminal_surface(surface_id));
+        pane.selected_surface = surface_id;
+        Ok(surface_id)
+    }
+
+    pub fn select_surface(&mut self, surface_id: SurfaceId) -> Result<(), ModelError> {
+        let pane = self.selected_pane_mut()?;
+        if pane.surface(surface_id).is_none() {
+            return Err(ModelError::UnknownSurface(surface_id));
+        }
+        pane.selected_surface = surface_id;
+        Ok(())
+    }
+
+    pub fn close_surface(&mut self, surface_id: SurfaceId) -> Result<Vec<SurfaceId>, ModelError> {
+        let mut removed = Vec::new();
+        let needs_replacement = {
+            let pane = self.selected_pane_mut()?;
+            let index = pane
+                .surfaces
+                .iter()
+                .position(|surface| surface.id == surface_id)
+                .ok_or(ModelError::UnknownSurface(surface_id))?;
+            pane.surfaces.remove(index);
+            removed.push(surface_id);
+            if pane.surfaces.is_empty() {
+                true
+            } else {
+                let next_index = index.saturating_sub(1).min(pane.surfaces.len() - 1);
+                pane.selected_surface = pane.surfaces[next_index].id;
+                false
+            }
+        };
+
+        if needs_replacement {
+            let replacement = self.ids.next_surface();
+            let pane = self.selected_pane_mut()?;
+            pane.surfaces.push(terminal_surface(replacement));
+            pane.selected_surface = replacement;
+        }
+
+        self.clear_unread_target_if_removed(&removed);
+        self.recompute_selected_workspace_unread()?;
+        Ok(removed)
+    }
+
     pub fn mark_surface_unread(
         &mut self,
         surface_id: SurfaceId,
         message: String,
     ) -> Result<(), ModelError> {
+        let sequence = self.next_unread_sequence;
+        self.next_unread_sequence += 1;
         let workspace = self.selected_workspace_mut()?;
+        let workspace_id = workspace.id;
+        let mut pane_id = None;
 
+        let surface = workspace
+            .panes
+            .iter_mut()
+            .find_map(|pane| {
+                let current_pane_id = pane.id;
+                let surface = pane.surface_mut(surface_id)?;
+                pane_id = Some(current_pane_id);
+                Some(surface)
+            })
+            .ok_or(ModelError::UnknownSurface(surface_id))?;
+
+        surface.unread = true;
+        workspace.unread = true;
+        workspace.latest_notification = Some(message.clone());
+        self.latest_unread_target = Some(UnreadTarget {
+            workspace_id,
+            pane_id: pane_id.expect("pane id is set when surface is found"),
+            surface_id,
+            message,
+            sequence,
+        });
+
+        Ok(())
+    }
+
+    pub fn mark_surface_read(&mut self, surface_id: SurfaceId) -> Result<(), ModelError> {
+        let workspace = self.selected_workspace_mut()?;
         let surface = workspace
             .panes
             .iter_mut()
             .find_map(|pane| pane.surface_mut(surface_id))
             .ok_or(ModelError::UnknownSurface(surface_id))?;
+        surface.unread = false;
+        self.recompute_selected_workspace_unread()?;
+        self.latest_unread_target = newest_unread_target(self);
+        Ok(())
+    }
 
-        surface.unread = true;
-        workspace.unread = true;
-        workspace.latest_notification = Some(message);
+    fn clear_unread_target_if_removed(&mut self, removed_surfaces: &[SurfaceId]) {
+        if self
+            .latest_unread_target
+            .as_ref()
+            .is_some_and(|target| removed_surfaces.contains(&target.surface_id))
+        {
+            self.latest_unread_target = newest_unread_target(self);
+        }
+    }
 
+    fn recompute_selected_workspace_unread(&mut self) -> Result<(), ModelError> {
+        let workspace = self.selected_workspace_mut()?;
+        workspace.unread = workspace
+            .panes
+            .iter()
+            .flat_map(|pane| pane.surfaces.iter())
+            .any(|surface| surface.unread);
+        if !workspace.unread {
+            workspace.latest_notification = None;
+        }
         Ok(())
     }
 }
@@ -275,10 +497,16 @@ pub enum ModelError {
     NoSelectedPane,
     #[error("layout is already split")]
     LayoutAlreadySplit,
+    #[error("unknown workspace {0:?}")]
+    UnknownWorkspace(WorkspaceId),
     #[error("unknown pane {0:?}")]
     UnknownPane(PaneId),
     #[error("unknown surface {0:?}")]
     UnknownSurface(SurfaceId),
+    #[error("cannot close the last workspace")]
+    CannotCloseLastWorkspace,
+    #[error("cannot close the last pane")]
+    CannotCloseLastPane,
 }
 
 fn workspace_title(cwd: &str) -> String {
@@ -295,6 +523,34 @@ fn terminal_surface(id: SurfaceId) -> Surface {
         title: "Terminal".to_string(),
         unread: false,
     }
+}
+
+fn workspace_surface_ids(workspace: &Workspace) -> Vec<SurfaceId> {
+    workspace
+        .panes
+        .iter()
+        .flat_map(|pane| pane.surfaces.iter().map(|surface| surface.id))
+        .collect()
+}
+
+fn newest_unread_target(app: &AppModel) -> Option<UnreadTarget> {
+    app.windows
+        .iter()
+        .flat_map(|window| window.workspaces.iter())
+        .flat_map(|workspace| {
+            workspace.panes.iter().flat_map(move |pane| {
+                pane.surfaces.iter().filter_map(move |surface| {
+                    surface.unread.then(|| UnreadTarget {
+                        workspace_id: workspace.id,
+                        pane_id: pane.id,
+                        surface_id: surface.id,
+                        message: workspace.latest_notification.clone().unwrap_or_default(),
+                        sequence: 0,
+                    })
+                })
+            })
+        })
+        .next()
 }
 
 #[cfg(test)]
@@ -433,5 +689,86 @@ mod tests {
             workspace.latest_notification,
             Some("Build finished".to_string())
         );
+    }
+
+    #[test]
+    fn app_can_create_select_rename_and_close_workspaces() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let original = app.selected_workspace().unwrap().id;
+
+        let beta = app
+            .create_workspace("C:/work/beta", Some("Beta".to_string()))
+            .unwrap();
+        assert_eq!(app.selected_workspace().unwrap().id, beta);
+        assert_eq!(app.selected_workspace().unwrap().title, "Beta");
+
+        app.rename_workspace(beta, "Beta renamed".to_string())
+            .unwrap();
+        assert_eq!(app.selected_workspace().unwrap().title, "Beta renamed");
+
+        app.select_workspace(original).unwrap();
+        app.close_workspace(beta).unwrap();
+
+        let window = app.selected_window().unwrap();
+        assert_eq!(window.workspaces.len(), 1);
+        assert_eq!(window.selected_workspace, original);
+    }
+
+    #[test]
+    fn app_can_open_select_and_close_terminal_tabs_without_emptying_pane() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let first = app.selected_pane().unwrap().selected_surface;
+
+        let second = app.open_terminal_surface().unwrap();
+        assert_eq!(app.selected_pane().unwrap().selected_surface, second);
+        assert_eq!(app.selected_pane().unwrap().surfaces.len(), 2);
+
+        app.select_surface(first).unwrap();
+        app.close_surface(first).unwrap();
+        assert_eq!(app.selected_pane().unwrap().selected_surface, second);
+
+        app.close_surface(second).unwrap();
+        let pane = app.selected_pane().unwrap();
+        assert_eq!(pane.surfaces.len(), 1);
+        assert_eq!(
+            pane.surface(pane.selected_surface).unwrap().kind,
+            SurfaceKind::Terminal
+        );
+    }
+
+    #[test]
+    fn closing_split_pane_returns_workspace_to_leaf_layout() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let first = app.selected_pane().unwrap().id;
+        let second = app.split_selected_pane(SplitAxis::Vertical).unwrap();
+
+        app.close_pane(second).unwrap();
+
+        let workspace = app.selected_workspace().unwrap();
+        assert_eq!(workspace.panes.len(), 1);
+        assert_eq!(workspace.selected_pane, first);
+        assert_eq!(workspace.layout, SplitTree::Leaf(first));
+    }
+
+    #[test]
+    fn unread_target_tracks_workspace_pane_and_surface() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let workspace_id = app.selected_workspace().unwrap().id;
+        let pane_id = app.selected_pane().unwrap().id;
+        let surface_id = app.selected_pane().unwrap().selected_surface;
+
+        app.mark_surface_unread(surface_id, "Build finished".to_string())
+            .unwrap();
+
+        let target = app.latest_unread_target.as_ref().unwrap();
+        assert_eq!(target.workspace_id, workspace_id);
+        assert_eq!(target.pane_id, pane_id);
+        assert_eq!(target.surface_id, surface_id);
+        assert_eq!(target.message, "Build finished");
+        assert_eq!(target.sequence, 1);
+
+        app.mark_surface_read(surface_id).unwrap();
+        assert_eq!(app.latest_unread_target, None);
+        assert!(!app.selected_workspace().unwrap().unread);
     }
 }
