@@ -288,6 +288,10 @@ fn sidebar(
 ) -> impl IntoView {
     let row_store = store.clone();
     let row_shared_model = shared_model.clone();
+    let new_workspace_store = store.clone();
+    let new_workspace_shared_model = shared_model.clone();
+    let close_workspace_store = store.clone();
+    let close_workspace_shared_model = shared_model.clone();
 
     v_stack((
         label(|| "workspaces").style(|s| s.color(MUTED_TEXT).font_size(11.0)),
@@ -304,10 +308,22 @@ fn sidebar(
                 let cwd = current_dir_cwd();
                 dispatch_shell_action(
                     controller,
-                    store.clone(),
-                    shared_model.clone(),
+                    new_workspace_store.clone(),
+                    new_workspace_shared_model.clone(),
                     AppAction::NewWorkspace { cwd, title: None },
                 );
+            })
+            .style(compact_button_style),
+        button(label(|| "x ws"))
+            .action(move || {
+                if let Ok(workspace) = controller.get().model.selected_workspace() {
+                    dispatch_shell_action(
+                        controller,
+                        close_workspace_store.clone(),
+                        close_workspace_shared_model.clone(),
+                        AppAction::CloseWorkspace(workspace.id),
+                    );
+                }
             })
             .style(compact_button_style),
     ))
@@ -358,32 +374,61 @@ fn workspace_controls(
     store: Arc<SessionStore>,
     shared_model: SharedAppModel,
 ) -> impl IntoView {
+    let new_tab_store = store.clone();
+    let new_tab_shared_model = shared_model.clone();
+    let split_store = store.clone();
+    let split_shared_model = shared_model.clone();
+    let close_tab_store = store.clone();
+    let close_tab_shared_model = shared_model.clone();
+    let close_pane_store = store.clone();
+    let close_pane_shared_model = shared_model.clone();
+
     h_stack((
         label(move || selected_workspace_title(controller))
             .style(|s| s.color(TEXT).font_size(13.0).font_bold().text_ellipsis()),
         h_stack((
             button(label(|| "+ tab"))
-                .action({
-                    let store = store.clone();
-                    let shared_model = shared_model.clone();
-                    move || {
-                        dispatch_shell_action(
-                            controller,
-                            store.clone(),
-                            shared_model.clone(),
-                            AppAction::NewTerminalTab,
-                        );
-                    }
+                .action(move || {
+                    dispatch_shell_action(
+                        controller,
+                        new_tab_store.clone(),
+                        new_tab_shared_model.clone(),
+                        AppAction::NewTerminalTab,
+                    );
                 })
                 .style(compact_button_style),
             button(label(|| "split"))
                 .action(move || {
                     dispatch_shell_action(
                         controller,
-                        store.clone(),
-                        shared_model.clone(),
+                        split_store.clone(),
+                        split_shared_model.clone(),
                         AppAction::SplitPane(SplitAxis::Vertical),
                     );
+                })
+                .style(compact_button_style),
+            button(label(|| "x tab"))
+                .action(move || {
+                    if let Ok(pane) = controller.get().model.selected_pane() {
+                        dispatch_shell_action(
+                            controller,
+                            close_tab_store.clone(),
+                            close_tab_shared_model.clone(),
+                            AppAction::CloseSurface(pane.selected_surface),
+                        );
+                    }
+                })
+                .style(compact_button_style),
+            button(label(|| "x pane"))
+                .action(move || {
+                    if let Ok(pane) = controller.get().model.selected_pane() {
+                        dispatch_shell_action(
+                            controller,
+                            close_pane_store.clone(),
+                            close_pane_shared_model.clone(),
+                            AppAction::ClosePane(pane.id),
+                        );
+                    }
                 })
                 .style(compact_button_style),
         ))

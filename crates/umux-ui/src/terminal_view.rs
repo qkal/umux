@@ -15,12 +15,14 @@ use umux_app::TerminalEntry;
 #[cfg(test)]
 use umux_core::ModelError;
 use umux_core::{AppModel, PaneId, SurfaceId, WorkspaceId};
+#[cfg(any(windows, test))]
+use umux_terminal::StartupEnvironment;
 #[cfg(windows)]
 use umux_terminal::{LiveTerminalSession, PtySpawnConfig, ShellResolver};
 use umux_terminal::{
-    StartupEnvironment, TerminalCell, TerminalColor, TerminalCursor, TerminalHealth,
-    TerminalInputRoute, TerminalInputRouter, TerminalKey, TerminalKeyEvent, TerminalMetrics,
-    TerminalNotification, TerminalRendererSnapshot, TerminalSelection, TerminalStatus,
+    TerminalCell, TerminalColor, TerminalCursor, TerminalHealth, TerminalInputRoute,
+    TerminalInputRouter, TerminalKey, TerminalKeyEvent, TerminalMetrics, TerminalNotification,
+    TerminalRendererSnapshot, TerminalSelection, TerminalStatus,
 };
 
 #[cfg(windows)]
@@ -195,6 +197,7 @@ impl TerminalLaunchContext {
         }
     }
 
+    #[cfg(any(windows, test))]
     fn startup_environment(&self) -> std::collections::HashMap<String, String> {
         StartupEnvironment::new(
             self.workspace_id.0,
