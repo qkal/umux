@@ -561,15 +561,35 @@ fn reconcile_layout(layout: SnapshotSplitTree, panes: &[Pane]) -> CoreSplitTree 
             first,
             second,
         } => {
-            let first = existing_pane_id(first.into(), panes);
-            let second = existing_pane_id(second.into(), panes);
-            match (first, second) {
-                (Some(first), Some(second)) if first != second => CoreSplitTree::Split {
+            let first_snapshot = first.into();
+            let second_snapshot = second.into();
+            let first_existing = existing_pane_id(first_snapshot, panes);
+            let second_existing = existing_pane_id(second_snapshot, panes);
+            let mut first = first_existing.unwrap_or(first_valid);
+            let mut second = second_existing.unwrap_or(first_valid);
+
+            if first == second {
+                if second_existing.is_none() {
+                    if let Some(alternate) = distinct_pane_id(panes, first) {
+                        second = alternate;
+                    }
+                } else if first_existing.is_none() {
+                    if let Some(alternate) = distinct_pane_id(panes, second) {
+                        first = alternate;
+                    }
+                } else if let Some(alternate) = distinct_pane_id(panes, first) {
+                    second = alternate;
+                }
+            }
+
+            if first != second {
+                CoreSplitTree::Split {
                     axis: axis.into(),
                     first,
                     second,
-                },
-                _ => CoreSplitTree::Leaf(first_valid),
+                }
+            } else {
+                CoreSplitTree::Leaf(first_valid)
             }
         }
     }
@@ -585,6 +605,10 @@ fn repair_pane_id(id: CorePaneId, panes: &[Pane], fallback: CorePaneId) -> CoreP
 
 fn existing_pane_id(id: CorePaneId, panes: &[Pane]) -> Option<CorePaneId> {
     panes.iter().any(|pane| pane.id == id).then_some(id)
+}
+
+fn distinct_pane_id(panes: &[Pane], id: CorePaneId) -> Option<CorePaneId> {
+    panes.iter().map(|pane| pane.id).find(|pane| *pane != id)
 }
 
 fn workspace_unread_state(panes: &[Pane]) -> (bool, Option<String>) {
@@ -846,6 +870,80 @@ mod tests {
         let workspace = model.selected_workspace().unwrap();
 
         assert_eq!(workspace.layout, SplitTree::Leaf(PaneId(3)));
+    }
+
+    #[test]
+    fn restore_repairs_one_missing_split_pane_to_distinct_existing_pane() {
+        let json = r#"{
+  "schema_version": 2,
+  "selected_window": 1,
+  "latest_unread_target": null,
+  "next_unread_sequence": 1,
+  "windows": [
+    {
+      "id": 1,
+      "selected_workspace": 2,
+      "workspaces": [
+        {
+          "id": 2,
+          "title": "alpha",
+          "cwd": "C:/work/alpha",
+          "selected_pane": 5,
+          "layout": { "type": "split", "axis": "vertical", "first": 5, "second": 999 },
+          "unread": false,
+          "latest_notification": null,
+          "panes": [
+            {
+              "id": 3,
+              "cwd": "C:/work/alpha",
+              "selected_surface": 4,
+              "surfaces": [
+                {
+                  "id": 4,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": false,
+                  "unread_message": null,
+                  "unread_sequence": null
+                }
+              ]
+            },
+            {
+              "id": 5,
+              "cwd": "C:/work/alpha",
+              "selected_surface": 6,
+              "surfaces": [
+                {
+                  "id": 6,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": false,
+                  "unread_message": null,
+                  "unread_sequence": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}"#;
+
+        let model = AppSnapshot::from_json_str(json)
+            .unwrap()
+            .into_model()
+            .unwrap();
+        let workspace = model.selected_workspace().unwrap();
+
+        assert_eq!(
+            workspace.layout,
+            SplitTree::Split {
+                axis: SplitAxis::Vertical,
+                first: PaneId(5),
+                second: PaneId(3),
+            }
+        );
     }
 
     #[test]
