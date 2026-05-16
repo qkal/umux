@@ -71,6 +71,13 @@ mod tests {
     }
 
     #[test]
+    fn id_gen_from_next_id_treats_value_as_last_issued_id() {
+        let mut ids = IdGen::from_next_id(42);
+
+        assert_eq!(ids.next_surface().0, 43);
+    }
+
+    #[test]
     fn id_gen_does_not_rewind_when_advancing_past_lower_id() {
         let mut ids = IdGen::new();
         assert_eq!(ids.next_surface().0, 1);
