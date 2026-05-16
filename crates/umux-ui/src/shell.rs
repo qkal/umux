@@ -14,6 +14,7 @@ use umux_app::session_store::SessionLoadOutcome;
 use umux_app::{
     AppAction, AppController, AppControllerError, SessionStore, SessionStoreError, TerminalEntry,
 };
+use umux_config::default_shortcuts;
 use umux_core::AppModel;
 use umux_core::model::{SplitTree, Workspace};
 use umux_core::{PaneId, SplitAxis, SurfaceId, SurfaceKind, WorkspaceId};
@@ -303,7 +304,15 @@ fn app_shell(
         let Some(chord) = chord_from_key_event(event) else {
             return EventPropagation::Continue;
         };
-        let Some(action) = action_for_shortcut(&chord).map(runtime_shortcut_action) else {
+        let controller_snapshot = controller.get();
+        let action = shell_action_for_shortcut(&controller_snapshot.model, &chord)
+            .map(runtime_shortcut_action);
+        drop(controller_snapshot);
+
+        let Some(action) = action else {
+            if let Some(action) = deferred_shortcut_action_for_chord(&chord) {
+                warn!(%chord, %action, "shortcut action is not part of the current MVP surface");
+            }
             return EventPropagation::Continue;
         };
 
@@ -358,17 +367,90 @@ fn runtime_shortcut_action(action: AppAction) -> AppAction {
     }
 }
 
-fn action_for_shortcut(chord: &str) -> Option<AppAction> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShortcutDisposition {
+    Shell,
+    Terminal,
+    Deferred,
+    Unbound,
+}
+
+fn shortcut_disposition_for_action(action: &str) -> ShortcutDisposition {
+    match action {
+        "new_workspace"
+        | "jump_workspace_1_8"
+        | "jump_last_workspace"
+        | "close_workspace"
+        | "new_surface"
+        | "close_surface"
+        | "split_right"
+        | "split_down"
+        | "jump_latest_unread" => ShortcutDisposition::Shell,
+        "copy" | "paste" => ShortcutDisposition::Terminal,
+        "toggle_sidebar" | "open_browser_split" | "focus_address_bar" | "show_notifications"
+        | "clear_scrollback" | "settings" => ShortcutDisposition::Deferred,
+        _ => ShortcutDisposition::Unbound,
+    }
+}
+
+fn deferred_shortcut_action_for_chord(chord: &str) -> Option<String> {
+    default_shortcuts()
+        .into_iter()
+        .find(|binding| {
+            shortcut_disposition_for_action(&binding.action) == ShortcutDisposition::Deferred
+                && binding
+                    .windows_bindings
+                    .iter()
+                    .any(|windows_binding| windows_binding.chord == chord)
+        })
+        .map(|binding| binding.action)
+}
+
+fn shell_action_for_shortcut(model: &AppModel, chord: &str) -> Option<AppAction> {
     match chord {
         "Ctrl+N" => Some(AppAction::NewWorkspace {
             cwd: ".".to_string(),
             title: None,
         }),
+        "Ctrl+1" => workspace_at_index(model, 0).map(AppAction::SelectWorkspace),
+        "Ctrl+2" => workspace_at_index(model, 1).map(AppAction::SelectWorkspace),
+        "Ctrl+3" => workspace_at_index(model, 2).map(AppAction::SelectWorkspace),
+        "Ctrl+4" => workspace_at_index(model, 3).map(AppAction::SelectWorkspace),
+        "Ctrl+5" => workspace_at_index(model, 4).map(AppAction::SelectWorkspace),
+        "Ctrl+6" => workspace_at_index(model, 5).map(AppAction::SelectWorkspace),
+        "Ctrl+7" => workspace_at_index(model, 6).map(AppAction::SelectWorkspace),
+        "Ctrl+8" => workspace_at_index(model, 7).map(AppAction::SelectWorkspace),
+        "Ctrl+9" => last_workspace(model).map(AppAction::SelectWorkspace),
+        "Ctrl+Shift+W" => model
+            .selected_workspace()
+            .ok()
+            .map(|workspace| AppAction::CloseWorkspace(workspace.id)),
         "Ctrl+T" => Some(AppAction::NewTerminalTab),
+        "Ctrl+W" => model
+            .selected_pane()
+            .ok()
+            .map(|pane| AppAction::CloseSurface(pane.selected_surface)),
         "Ctrl+Alt+D" => Some(AppAction::SplitPane(SplitAxis::Vertical)),
+        "Ctrl+Shift+Alt+D" => Some(AppAction::SplitPane(SplitAxis::Horizontal)),
         "Ctrl+Shift+U" => Some(AppAction::JumpLatestUnread),
         _ => None,
     }
+}
+
+fn workspace_at_index(model: &AppModel, index: usize) -> Option<WorkspaceId> {
+    model
+        .selected_window()
+        .ok()
+        .and_then(|window| window.workspaces.get(index))
+        .map(|workspace| workspace.id)
+}
+
+fn last_workspace(model: &AppModel) -> Option<WorkspaceId> {
+    model
+        .selected_window()
+        .ok()
+        .and_then(|window| window.workspaces.last())
+        .map(|workspace| workspace.id)
 }
 
 fn chord_from_key_event(event: &floem::keyboard::KeyEvent) -> Option<String> {
@@ -1044,6 +1126,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use umux_app::session_store::SessionLoadOutcome;
     use umux_app::{AppAction, AppController, SessionStore, SessionStoreError};
+    use umux_config::default_shortcuts;
     use umux_core::model::{Pane, SplitTree, Surface, SurfaceKind, Workspace};
     use umux_core::{PaneId, SurfaceId, WorkspaceId};
 
@@ -1064,27 +1147,136 @@ mod tests {
     }
 
     #[test]
-    fn maps_shell_shortcuts_to_actions() {
+    fn maps_safe_shell_shortcuts_to_actions() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let mut workspaces = vec![model.selected_workspace().unwrap().id];
+        for index in 2..=9 {
+            let workspace = model
+                .create_workspace(
+                    format!("C:/work/workspace-{index}"),
+                    Some(format!("Workspace {index}")),
+                )
+                .unwrap();
+            workspaces.push(workspace);
+        }
+        let selected_workspace = model.selected_workspace().unwrap().id;
+        let selected_surface = model.selected_pane().unwrap().selected_surface;
+
         assert_eq!(
-            action_for_shortcut("Ctrl+N"),
+            shell_action_for_shortcut(&model, "Ctrl+N"),
             Some(AppAction::NewWorkspace {
                 cwd: ".".to_string(),
                 title: None,
             })
         );
         assert_eq!(
-            action_for_shortcut("Ctrl+T"),
+            shell_action_for_shortcut(&model, "Ctrl+T"),
             Some(AppAction::NewTerminalTab)
         );
         assert_eq!(
-            action_for_shortcut("Ctrl+Alt+D"),
+            shell_action_for_shortcut(&model, "Ctrl+W"),
+            Some(AppAction::CloseSurface(selected_surface))
+        );
+        assert_eq!(
+            shell_action_for_shortcut(&model, "Ctrl+Alt+D"),
             Some(AppAction::SplitPane(SplitAxis::Vertical))
         );
         assert_eq!(
-            action_for_shortcut("Ctrl+Shift+U"),
+            shell_action_for_shortcut(&model, "Ctrl+Shift+Alt+D"),
+            Some(AppAction::SplitPane(SplitAxis::Horizontal))
+        );
+        assert_eq!(
+            shell_action_for_shortcut(&model, "Ctrl+Shift+U"),
             Some(AppAction::JumpLatestUnread)
         );
-        assert_eq!(action_for_shortcut("Ctrl+X"), None);
+        assert_eq!(
+            shell_action_for_shortcut(&model, "Ctrl+Shift+W"),
+            Some(AppAction::CloseWorkspace(selected_workspace))
+        );
+
+        for (index, workspace_id) in workspaces.iter().take(8).enumerate() {
+            assert_eq!(
+                shell_action_for_shortcut(&model, &format!("Ctrl+{}", index + 1)),
+                Some(AppAction::SelectWorkspace(*workspace_id))
+            );
+        }
+        assert_eq!(
+            shell_action_for_shortcut(&model, "Ctrl+9"),
+            Some(AppAction::SelectWorkspace(*workspaces.last().unwrap()))
+        );
+        assert_eq!(shell_action_for_shortcut(&model, "Ctrl+X"), None);
+    }
+
+    #[test]
+    fn default_shortcuts_are_classified_for_mvp_runtime() {
+        let shell_actions = [
+            "new_workspace",
+            "jump_workspace_1_8",
+            "jump_last_workspace",
+            "close_workspace",
+            "new_surface",
+            "close_surface",
+            "split_right",
+            "split_down",
+            "jump_latest_unread",
+        ];
+        let terminal_actions = ["copy", "paste"];
+        let deferred_actions = [
+            "toggle_sidebar",
+            "open_browser_split",
+            "focus_address_bar",
+            "show_notifications",
+            "clear_scrollback",
+            "settings",
+        ];
+
+        for action in shell_actions {
+            assert_eq!(
+                shortcut_disposition_for_action(action),
+                ShortcutDisposition::Shell
+            );
+        }
+        for action in terminal_actions {
+            assert_eq!(
+                shortcut_disposition_for_action(action),
+                ShortcutDisposition::Terminal
+            );
+        }
+        for action in deferred_actions {
+            assert_eq!(
+                shortcut_disposition_for_action(action),
+                ShortcutDisposition::Deferred
+            );
+        }
+        assert_eq!(
+            shortcut_disposition_for_action("quit"),
+            ShortcutDisposition::Unbound
+        );
+
+        for binding in default_shortcuts() {
+            if binding.action == "quit" {
+                continue;
+            }
+            assert_ne!(
+                shortcut_disposition_for_action(&binding.action),
+                ShortcutDisposition::Unbound,
+                "{} should be classified",
+                binding.action
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_shortcuts_are_logged_but_not_handled_by_shell() {
+        let model = AppModel::new("C:/work/alpha");
+
+        assert_eq!(shell_action_for_shortcut(&model, "Ctrl+Shift+L"), None);
+        assert_eq!(
+            deferred_shortcut_action_for_chord("Ctrl+Shift+L").as_deref(),
+            Some("open_browser_split")
+        );
+        assert_eq!(shell_action_for_shortcut(&model, "Ctrl+Shift+C"), None);
+        assert_eq!(deferred_shortcut_action_for_chord("Ctrl+Shift+C"), None);
     }
 
     #[test]
