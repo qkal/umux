@@ -3361,6 +3361,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "umux-app"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "serde",
+ "thiserror 2.0.18",
+ "umux-config",
+ "umux-core",
+ "umux-session",
+ "umux-terminal",
+]
+
+[[package]]
 name = "umux-browser"
 version = "0.1.0"
 dependencies = [
