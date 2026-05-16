@@ -1267,6 +1267,69 @@ mod tests {
     }
 
     #[test]
+    fn default_shortcut_chords_match_runtime_handling() {
+        let model = model_with_nine_workspaces();
+
+        for binding in default_shortcuts() {
+            let windows_chords = expanded_windows_chords(&binding);
+
+            match shortcut_disposition_for_action(&binding.action) {
+                ShortcutDisposition::Shell => {
+                    for chord in windows_chords {
+                        assert!(
+                            shell_action_for_shortcut(&model, &chord).is_some(),
+                            "{} declared shell chord {chord} should be handled by the shell",
+                            binding.action
+                        );
+                    }
+                }
+                ShortcutDisposition::Deferred => {
+                    for chord in windows_chords {
+                        assert_eq!(
+                            deferred_shortcut_action_for_chord(&chord).as_deref(),
+                            Some(binding.action.as_str()),
+                            "{} declared deferred chord {chord} should resolve to its action",
+                            binding.action
+                        );
+                    }
+                }
+                ShortcutDisposition::Terminal => {
+                    for chord in windows_chords {
+                        assert_eq!(
+                            shell_action_for_shortcut(&model, &chord),
+                            None,
+                            "{} declared terminal chord {chord} should not be shell-handled",
+                            binding.action
+                        );
+                        assert_eq!(
+                            deferred_shortcut_action_for_chord(&chord),
+                            None,
+                            "{} declared terminal chord {chord} should not be deferred",
+                            binding.action
+                        );
+                    }
+                }
+                ShortcutDisposition::Unbound => {
+                    for chord in windows_chords {
+                        assert_eq!(
+                            shell_action_for_shortcut(&model, &chord),
+                            None,
+                            "{} declared unbound chord {chord} should not be shell-handled",
+                            binding.action
+                        );
+                        assert_eq!(
+                            deferred_shortcut_action_for_chord(&chord),
+                            None,
+                            "{} declared unbound chord {chord} should not be deferred",
+                            binding.action
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn deferred_shortcuts_are_logged_but_not_handled_by_shell() {
         let model = AppModel::new("C:/work/alpha");
 
@@ -1295,6 +1358,35 @@ mod tests {
 
         let loaded = store.load_model().unwrap().unwrap();
         assert_eq!(loaded.selected_workspace().unwrap().title, "Beta");
+    }
+
+    fn model_with_nine_workspaces() -> AppModel {
+        let mut model = AppModel::new("C:/work/alpha");
+        for index in 2..=9 {
+            model
+                .create_workspace(
+                    format!("C:/work/workspace-{index}"),
+                    Some(format!("Workspace {index}")),
+                )
+                .unwrap();
+        }
+        model
+    }
+
+    fn expanded_windows_chords(binding: &umux_config::ShortcutBinding) -> Vec<String> {
+        binding
+            .windows_bindings
+            .iter()
+            .flat_map(|windows_binding| expand_shortcut_chord(&windows_binding.chord))
+            .collect()
+    }
+
+    fn expand_shortcut_chord(chord: &str) -> Vec<String> {
+        if chord == "Ctrl+1-8" {
+            (1..=8).map(|index| format!("Ctrl+{index}")).collect()
+        } else {
+            vec![chord.to_string()]
+        }
     }
 
     #[test]
