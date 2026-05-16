@@ -41,6 +41,120 @@ function Assert-IsUnderPath {
     }
 }
 
+function Get-PackageLicense {
+    param(
+        [Parameter(Mandatory = $true)]$Package,
+        [Parameter(Mandatory = $true)][string]$SourceDir
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Package.license)) {
+        return $Package.license
+    }
+
+    $licenseLabelsByFile = @{
+        "LICENSE-AGPL" = "AGPL-3.0-or-later"
+        "LICENSE-APACHE" = "Apache-2.0"
+        "LICENSE-GPL" = "GPL-3.0-or-later"
+    }
+
+    $inferredLicenses = foreach ($licenseFile in ($licenseLabelsByFile.Keys | Sort-Object)) {
+        $licensePath = Join-Path $SourceDir $licenseFile
+        if (Test-Path -LiteralPath $licensePath -PathType Leaf) {
+            $licenseLabelsByFile[$licenseFile]
+        }
+    }
+
+    if ($inferredLicenses.Count -gt 0) {
+        return ($inferredLicenses -join " OR ")
+    }
+
+    return "see crate manifest"
+}
+
+function Copy-RootLicenseFiles {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][string]$DestinationRoot
+    )
+
+    $licenseFiles = @("LICENSE-APACHE", "LICENSE-GPL", "LICENSE-AGPL")
+    New-Item -ItemType Directory -Force -Path $DestinationRoot | Out-Null
+
+    foreach ($licenseFile in $licenseFiles) {
+        $sourceLicense = Join-Path $SourceRoot $licenseFile
+        if (Test-Path -LiteralPath $sourceLicense -PathType Leaf) {
+            Copy-Item -LiteralPath $sourceLicense -Destination (Join-Path $DestinationRoot $licenseFile) -Force
+        }
+    }
+}
+
+function Assert-LicensePointersResolve {
+    param(
+        [Parameter(Mandatory = $true)][string]$CrateRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $CrateRoot -PathType Container)) {
+        return
+    }
+
+    $licenseFiles = Get-ChildItem -LiteralPath $CrateRoot -Recurse -Force -File -Filter "LICENSE-*"
+    foreach ($licenseFile in $licenseFiles) {
+        $content = Get-Content -LiteralPath $licenseFile.FullName -Raw
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            continue
+        }
+
+        $pointer = $content.TrimStart()
+        if (-not ($pointer.StartsWith("../", [System.StringComparison]::Ordinal) -or $pointer.StartsWith("..\", [System.StringComparison]::Ordinal))) {
+            continue
+        }
+
+        $pointerTarget = ($pointer -split "\r?\n", 2)[0].Trim()
+        $resolvedTarget = [System.IO.Path]::GetFullPath((Join-Path $licenseFile.DirectoryName $pointerTarget))
+        if (-not (Test-Path -LiteralPath $resolvedTarget -PathType Leaf)) {
+            throw "License pointer '$($licenseFile.FullName)' points to missing target '$resolvedTarget'."
+        }
+    }
+}
+
+function Repair-LicensePointersToVendorRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$CrateRoot,
+        [Parameter(Mandatory = $true)][string]$VendorRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $CrateRoot -PathType Container)) {
+        return
+    }
+
+    $licenseFiles = Get-ChildItem -LiteralPath $CrateRoot -Recurse -Force -File -Filter "LICENSE-*"
+    foreach ($licenseFile in $licenseFiles) {
+        $content = Get-Content -LiteralPath $licenseFile.FullName -Raw
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            continue
+        }
+
+        $pointer = $content.TrimStart()
+        if (-not ($pointer.StartsWith("../", [System.StringComparison]::Ordinal) -or $pointer.StartsWith("..\", [System.StringComparison]::Ordinal))) {
+            continue
+        }
+
+        $pointerTarget = ($pointer -split "\r?\n", 2)[0].Trim()
+        $resolvedTarget = [System.IO.Path]::GetFullPath((Join-Path $licenseFile.DirectoryName $pointerTarget))
+        if (Test-Path -LiteralPath $resolvedTarget -PathType Leaf) {
+            continue
+        }
+
+        $vendorRootTarget = Join-Path $VendorRoot (Split-Path -Leaf $pointerTarget)
+        if (-not (Test-Path -LiteralPath $vendorRootTarget -PathType Leaf)) {
+            continue
+        }
+
+        $relativeTarget = [System.IO.Path]::GetRelativePath($licenseFile.DirectoryName, $vendorRootTarget) -replace "\\", "/"
+        Set-Content -LiteralPath $licenseFile.FullName -Value $relativeTarget -NoNewline -Encoding UTF8
+    }
+}
+
 $RepoRoot = [System.IO.Path]::GetFullPath($RepoRoot)
 $ZedRoot = [System.IO.Path]::GetFullPath($ZedRoot)
 $zedCargoToml = Join-Path $ZedRoot "Cargo.toml"
@@ -141,7 +255,7 @@ $selectedRows = foreach ($package in ($selectedPackagesByName.Values | Sort-Obje
         Source = $sourceDir
         RelativeSource = $relativeSourceDir
         Destination = $destDir
-        License = if ([string]::IsNullOrWhiteSpace($package.license)) { "see crate manifest" } else { $package.license }
+        License = Get-PackageLicense -Package $package -SourceDir $sourceDir
     }
 }
 
@@ -165,6 +279,8 @@ $vendorCrateRoot = Join-Path $vendorRoot "crates"
 New-Item -ItemType Directory -Force -Path $vendorCrateRoot | Out-Null
 $resolvedVendorCrateRoot = Resolve-ExistingPath $vendorCrateRoot
 
+Copy-RootLicenseFiles -SourceRoot $ZedRoot -DestinationRoot $vendorRoot
+
 foreach ($row in $selectedRows) {
     $destination = [System.IO.Path]::GetFullPath($row.Destination)
     Assert-IsUnderPath -ChildPath $destination -ParentPath $resolvedVendorCrateRoot -Description "Crate destination"
@@ -185,6 +301,9 @@ foreach ($row in $selectedRows) {
         Remove-Item -LiteralPath $resolvedTargetDir -Recurse -Force
     }
 }
+
+Repair-LicensePointersToVendorRoot -CrateRoot $resolvedVendorCrateRoot -VendorRoot $vendorRoot
+Assert-LicensePointersResolve -CrateRoot $resolvedVendorCrateRoot
 
 $readmeRows = foreach ($row in $selectedRows) {
     "| $($row.Crate) | $($row.RelativeSource) | $($row.License) |"
