@@ -12,7 +12,9 @@ use floem::ext_event::create_signal_from_channel;
 use floem::keyboard::{Key, Modifiers, NamedKey};
 use floem::prelude::*;
 use umux_app::TerminalEntry;
-use umux_core::{AppModel, ModelError, PaneId, SurfaceId, WorkspaceId};
+use umux_core::{AppModel, PaneId, SurfaceId, WorkspaceId};
+#[cfg(test)]
+use umux_core::ModelError;
 #[cfg(windows)]
 use umux_terminal::{LiveTerminalSession, PtySpawnConfig, ShellResolver};
 use umux_terminal::{
@@ -159,6 +161,7 @@ pub(crate) struct TerminalLaunchContext {
 }
 
 impl TerminalLaunchContext {
+    #[cfg(test)]
     pub(crate) fn from_model(model: &AppModel) -> Result<Self, ModelError> {
         let workspace = model.selected_workspace()?;
         let pane = workspace
