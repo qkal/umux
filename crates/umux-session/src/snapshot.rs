@@ -4,15 +4,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use umux_core::{
     AppModel, SplitAxis as CoreSplitAxis, SplitTree as CoreSplitTree,
-    SurfaceKind as CoreSurfaceKind,
+    SurfaceKind as CoreSurfaceKind, UnreadTarget as CoreUnreadTarget,
     ids::{
-        PaneId as CorePaneId, SurfaceId as CoreSurfaceId, WindowId as CoreWindowId,
+        IdGen, PaneId as CorePaneId, SurfaceId as CoreSurfaceId, WindowId as CoreWindowId,
         WorkspaceId as CoreWorkspaceId,
     },
     model::{AppWindow, Pane, Surface, Workspace},
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -20,12 +20,24 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
     #[error("unsupported session snapshot schema version {0}")]
     UnsupportedSchemaVersion(u32),
+    #[error("restored snapshot selected window is missing")]
+    MissingSelectedWindow,
+    #[error("restored snapshot window has no workspaces")]
+    MissingSelectedWorkspace,
+    #[error("restored snapshot workspace has no panes")]
+    MissingSelectedPane,
+    #[error("restored snapshot pane has no surfaces")]
+    MissingSelectedSurface,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AppSnapshot {
     pub schema_version: u32,
     pub selected_window: SnapshotWindowId,
+    #[serde(default)]
+    pub latest_unread_target: Option<SnapshotUnreadTarget>,
+    #[serde(default)]
+    pub next_unread_sequence: u64,
     pub windows: Vec<AppWindowSnapshot>,
 }
 
@@ -34,6 +46,8 @@ impl AppSnapshot {
         Self {
             schema_version: SCHEMA_VERSION,
             selected_window: app.selected_window.into(),
+            latest_unread_target: app.latest_unread_target.as_ref().map(Into::into),
+            next_unread_sequence: app.next_unread_sequence,
             windows: app.windows.iter().map(AppWindowSnapshot::from).collect(),
         }
     }
@@ -44,15 +58,155 @@ impl AppSnapshot {
 
     pub fn from_json_str(json: &str) -> Result<Self, SessionError> {
         let envelope: SnapshotEnvelope = serde_json::from_str(json)?;
-        if envelope.schema_version != SCHEMA_VERSION {
-            return Err(SessionError::UnsupportedSchemaVersion(
-                envelope.schema_version,
-            ));
+        match envelope.schema_version {
+            SCHEMA_VERSION => serde_json::from_str(json).map_err(SessionError::from),
+            1 => {
+                let mut snapshot: Self = serde_json::from_str(json)?;
+                snapshot.schema_version = SCHEMA_VERSION;
+                snapshot.latest_unread_target = None;
+                snapshot.next_unread_sequence = 1;
+                Ok(snapshot)
+            }
+            version => Err(SessionError::UnsupportedSchemaVersion(version)),
+        }
+    }
+
+    pub fn into_model(self) -> Result<AppModel, SessionError> {
+        let mut max_id = self.max_restored_id();
+        let selected_window = self.selected_window.into();
+        if !self
+            .windows
+            .iter()
+            .any(|window| CoreWindowId::from(window.id) == selected_window)
+        {
+            return Err(SessionError::MissingSelectedWindow);
         }
 
-        let snapshot: Self = serde_json::from_str(json)?;
+        let latest_unread_target = self.latest_unread_target.map(Into::into);
+        let mut max_unread_sequence = latest_unread_target
+            .as_ref()
+            .map(|target: &CoreUnreadTarget| target.sequence)
+            .unwrap_or(0);
 
-        Ok(snapshot)
+        let mut windows = Vec::with_capacity(self.windows.len());
+        for window in self.windows {
+            let mut workspaces = Vec::with_capacity(window.workspaces.len());
+            for workspace in window.workspaces {
+                let mut panes = Vec::with_capacity(workspace.panes.len());
+                for pane in workspace.panes {
+                    let mut surfaces = pane
+                        .surfaces
+                        .into_iter()
+                        .map(|surface| {
+                            max_unread_sequence =
+                                max_unread_sequence.max(surface.unread_sequence.unwrap_or(0));
+                            Surface::from(surface)
+                        })
+                        .collect::<Vec<_>>();
+
+                    if surfaces.is_empty() {
+                        return Err(SessionError::MissingSelectedSurface);
+                    }
+
+                    let selected_surface = reconcile_selected_surface(
+                        pane.selected_surface.into(),
+                        &mut surfaces,
+                        &mut max_id,
+                    );
+
+                    panes.push(Pane {
+                        id: pane.id.into(),
+                        cwd: pane.cwd,
+                        surfaces,
+                        selected_surface,
+                    });
+                }
+
+                if panes.is_empty() {
+                    return Err(SessionError::MissingSelectedPane);
+                }
+
+                let selected_pane = if panes
+                    .iter()
+                    .any(|pane| pane.id == workspace.selected_pane.into())
+                {
+                    workspace.selected_pane.into()
+                } else {
+                    panes[0].id
+                };
+                let layout = reconcile_layout(workspace.layout, &panes);
+
+                workspaces.push(Workspace {
+                    id: workspace.id.into(),
+                    title: workspace.title,
+                    cwd: workspace.cwd,
+                    panes,
+                    selected_pane,
+                    layout,
+                    unread: workspace.unread,
+                    latest_notification: workspace.latest_notification,
+                });
+            }
+
+            if workspaces.is_empty() {
+                return Err(SessionError::MissingSelectedWorkspace);
+            }
+
+            let selected_workspace = if workspaces
+                .iter()
+                .any(|workspace| workspace.id == window.selected_workspace.into())
+            {
+                window.selected_workspace.into()
+            } else {
+                workspaces[0].id
+            };
+
+            windows.push(AppWindow {
+                id: window.id.into(),
+                workspaces,
+                selected_workspace,
+            });
+        }
+
+        let next_unread_sequence = 1
+            .max(self.next_unread_sequence)
+            .max(max_unread_sequence.saturating_add(1));
+
+        Ok(AppModel {
+            ids: IdGen::from_next_id(max_id),
+            windows,
+            selected_window,
+            latest_unread_target,
+            next_unread_sequence,
+        })
+    }
+
+    fn max_restored_id(&self) -> u64 {
+        let mut max_id = self.selected_window.0;
+        if let Some(target) = &self.latest_unread_target {
+            max_id = max_id
+                .max(target.workspace_id.0)
+                .max(target.pane_id.0)
+                .max(target.surface_id.0);
+        }
+
+        for window in &self.windows {
+            max_id = max_id.max(window.id.0).max(window.selected_workspace.0);
+            for workspace in &window.workspaces {
+                max_id = max_id
+                    .max(workspace.id.0)
+                    .max(workspace.selected_pane.0)
+                    .max(workspace.layout.max_id());
+                for pane in &workspace.panes {
+                    max_id = max_id.max(pane.id.0).max(pane.selected_surface.0);
+                    for surface in &pane.surfaces {
+                        max_id = max_id.max(surface.id.0);
+                    }
+                }
+            }
+        }
+
+        max_id
     }
 }
 
@@ -71,12 +225,24 @@ impl From<CoreWindowId> for SnapshotWindowId {
     }
 }
 
+impl From<SnapshotWindowId> for CoreWindowId {
+    fn from(id: SnapshotWindowId) -> Self {
+        Self(id.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct SnapshotWorkspaceId(pub u64);
 
 impl From<CoreWorkspaceId> for SnapshotWorkspaceId {
     fn from(id: CoreWorkspaceId) -> Self {
+        Self(id.0)
+    }
+}
+
+impl From<SnapshotWorkspaceId> for CoreWorkspaceId {
+    fn from(id: SnapshotWorkspaceId) -> Self {
         Self(id.0)
     }
 }
@@ -91,6 +257,12 @@ impl From<CorePaneId> for SnapshotPaneId {
     }
 }
 
+impl From<SnapshotPaneId> for CorePaneId {
+    fn from(id: SnapshotPaneId) -> Self {
+        Self(id.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct SnapshotSurfaceId(pub u64);
@@ -98,6 +270,45 @@ pub struct SnapshotSurfaceId(pub u64);
 impl From<CoreSurfaceId> for SnapshotSurfaceId {
     fn from(id: CoreSurfaceId) -> Self {
         Self(id.0)
+    }
+}
+
+impl From<SnapshotSurfaceId> for CoreSurfaceId {
+    fn from(id: SnapshotSurfaceId) -> Self {
+        Self(id.0)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotUnreadTarget {
+    pub workspace_id: SnapshotWorkspaceId,
+    pub pane_id: SnapshotPaneId,
+    pub surface_id: SnapshotSurfaceId,
+    pub message: String,
+    pub sequence: u64,
+}
+
+impl From<&CoreUnreadTarget> for SnapshotUnreadTarget {
+    fn from(target: &CoreUnreadTarget) -> Self {
+        Self {
+            workspace_id: target.workspace_id.into(),
+            pane_id: target.pane_id.into(),
+            surface_id: target.surface_id.into(),
+            message: target.message.clone(),
+            sequence: target.sequence,
+        }
+    }
+}
+
+impl From<SnapshotUnreadTarget> for CoreUnreadTarget {
+    fn from(target: SnapshotUnreadTarget) -> Self {
+        Self {
+            workspace_id: target.workspace_id.into(),
+            pane_id: target.pane_id.into(),
+            surface_id: target.surface_id.into(),
+            message: target.message,
+            sequence: target.sequence,
+        }
     }
 }
 
@@ -113,6 +324,15 @@ impl From<CoreSurfaceKind> for SnapshotSurfaceKind {
         match kind {
             CoreSurfaceKind::Terminal => Self::Terminal,
             CoreSurfaceKind::Browser => Self::Browser,
+        }
+    }
+}
+
+impl From<SnapshotSurfaceKind> for CoreSurfaceKind {
+    fn from(kind: SnapshotSurfaceKind) -> Self {
+        match kind {
+            SnapshotSurfaceKind::Terminal => Self::Terminal,
+            SnapshotSurfaceKind::Browser => Self::Browser,
         }
     }
 }
@@ -135,6 +355,15 @@ impl From<CoreSplitAxis> for SnapshotSplitAxis {
         match axis {
             CoreSplitAxis::Horizontal => Self::Horizontal,
             CoreSplitAxis::Vertical => Self::Vertical,
+        }
+    }
+}
+
+impl From<SnapshotSplitAxis> for CoreSplitAxis {
+    fn from(axis: SnapshotSplitAxis) -> Self {
+        match axis {
+            SnapshotSplitAxis::Horizontal => Self::Horizontal,
+            SnapshotSplitAxis::Vertical => Self::Vertical,
         }
     }
 }
@@ -167,6 +396,15 @@ impl From<&CoreSplitTree> for SnapshotSplitTree {
                 first: (*first).into(),
                 second: (*second).into(),
             },
+        }
+    }
+}
+
+impl SnapshotSplitTree {
+    fn max_id(&self) -> u64 {
+        match self {
+            Self::Leaf { pane } => pane.0,
+            Self::Split { first, second, .. } => first.0.max(second.0),
         }
     }
 }
@@ -244,6 +482,10 @@ pub struct SurfaceSnapshot {
     pub kind: SnapshotSurfaceKind,
     pub title: String,
     pub unread: bool,
+    #[serde(default)]
+    pub unread_message: Option<String>,
+    #[serde(default)]
+    pub unread_sequence: Option<u64>,
 }
 
 impl From<&Surface> for SurfaceSnapshot {
@@ -253,7 +495,81 @@ impl From<&Surface> for SurfaceSnapshot {
             kind: surface.kind.into(),
             title: surface.title.clone(),
             unread: surface.unread,
+            unread_message: surface.unread_message.clone(),
+            unread_sequence: surface.unread_sequence,
         }
+    }
+}
+
+impl From<SurfaceSnapshot> for Surface {
+    fn from(surface: SurfaceSnapshot) -> Self {
+        Self {
+            id: surface.id.into(),
+            kind: surface.kind.into(),
+            title: surface.title,
+            unread: surface.unread,
+            unread_message: surface.unread_message,
+            unread_sequence: surface.unread_sequence,
+        }
+    }
+}
+
+fn reconcile_selected_surface(
+    selected_surface: CoreSurfaceId,
+    surfaces: &mut Vec<Surface>,
+    max_id: &mut u64,
+) -> CoreSurfaceId {
+    if surfaces
+        .iter()
+        .any(|surface| surface.id == selected_surface && surface.kind == CoreSurfaceKind::Terminal)
+    {
+        return selected_surface;
+    }
+
+    if let Some(terminal) = surfaces
+        .iter()
+        .find(|surface| surface.kind == CoreSurfaceKind::Terminal)
+    {
+        return terminal.id;
+    }
+
+    *max_id = max_id.saturating_add(1);
+    let replacement = CoreSurfaceId(*max_id);
+    surfaces.push(Surface {
+        id: replacement,
+        kind: CoreSurfaceKind::Terminal,
+        title: "Terminal".to_string(),
+        unread: false,
+        unread_message: None,
+        unread_sequence: None,
+    });
+    replacement
+}
+
+fn reconcile_layout(layout: SnapshotSplitTree, panes: &[Pane]) -> CoreSplitTree {
+    let first_valid = panes[0].id;
+    match layout {
+        SnapshotSplitTree::Leaf { pane } => {
+            let pane = repair_pane_id(pane.into(), panes, first_valid);
+            CoreSplitTree::Leaf(pane)
+        }
+        SnapshotSplitTree::Split {
+            axis,
+            first,
+            second,
+        } => CoreSplitTree::Split {
+            axis: axis.into(),
+            first: repair_pane_id(first.into(), panes, first_valid),
+            second: repair_pane_id(second.into(), panes, first_valid),
+        },
+    }
+}
+
+fn repair_pane_id(id: CorePaneId, panes: &[Pane], fallback: CorePaneId) -> CorePaneId {
+    if panes.iter().any(|pane| pane.id == id) {
+        id
+    } else {
+        fallback
     }
 }
 
@@ -261,7 +577,10 @@ impl From<&Surface> for SurfaceSnapshot {
 mod tests {
     use super::{AppSnapshot, SessionError};
     use serde_json::Value;
-    use umux_core::{AppModel, SplitAxis, SurfaceKind};
+    use umux_core::{
+        AppModel, SplitAxis, SurfaceKind,
+        ids::{PaneId, SurfaceId, WindowId, WorkspaceId},
+    };
 
     #[test]
     fn snapshot_round_trips_app_owned_state() {
@@ -274,7 +593,7 @@ mod tests {
         let json = snapshot.to_json_string().unwrap();
         let snapshot = AppSnapshot::from_json_str(&json).unwrap();
 
-        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.schema_version, 2);
         assert_eq!(snapshot.windows.len(), 1);
         assert_eq!(snapshot.windows[0].workspaces[0].panes.len(), 2);
         assert!(
@@ -300,30 +619,234 @@ mod tests {
 
     #[test]
     fn unsupported_schema_version_is_rejected() {
-        let json = r#"{"schema_version":2,"selected_window":1,"windows":[]}"#;
+        let json = r#"{"schema_version":3,"selected_window":1,"windows":[]}"#;
 
         let result = AppSnapshot::from_json_str(json);
 
         assert!(matches!(
             result,
-            Err(SessionError::UnsupportedSchemaVersion(2))
+            Err(SessionError::UnsupportedSchemaVersion(3))
         ));
     }
 
     #[test]
     fn unsupported_schema_version_is_rejected_before_body_deserialization() {
-        let json = r#"{"schema_version":2,"future_shape":{"anything":true}}"#;
+        let json = r#"{"schema_version":3,"future_shape":{"anything":true}}"#;
 
         let result = AppSnapshot::from_json_str(json);
 
         assert!(matches!(
             result,
-            Err(SessionError::UnsupportedSchemaVersion(2))
+            Err(SessionError::UnsupportedSchemaVersion(3))
         ));
     }
 
     #[test]
-    fn snapshot_json_uses_stable_v1_wire_contract() {
+    fn snapshot_restores_model_and_advances_id_generator() {
+        let json = r#"{
+  "schema_version": 2,
+  "selected_window": 1,
+  "latest_unread_target": null,
+  "next_unread_sequence": 1,
+  "windows": [
+    {
+      "id": 1,
+      "selected_workspace": 999,
+      "workspaces": [
+        {
+          "id": 2,
+          "title": "alpha",
+          "cwd": "C:/work/alpha",
+          "selected_pane": 999,
+          "layout": { "type": "leaf", "pane": 999 },
+          "unread": false,
+          "latest_notification": null,
+          "panes": [
+            {
+              "id": 3,
+              "cwd": "C:/work/alpha",
+              "selected_surface": 999,
+              "surfaces": [
+                {
+                  "id": 4,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": false,
+                  "unread_message": null,
+                  "unread_sequence": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}"#;
+
+        let mut model = AppSnapshot::from_json_str(json)
+            .unwrap()
+            .into_model()
+            .unwrap();
+
+        assert_eq!(model.selected_window, WindowId(1));
+        let workspace = model.selected_workspace().unwrap();
+        assert_eq!(workspace.id, WorkspaceId(2));
+        assert_eq!(workspace.selected_pane, PaneId(3));
+        let pane = workspace.selected_pane().unwrap();
+        assert_eq!(pane.selected_surface, SurfaceId(4));
+        assert_eq!(model.ids.next_surface(), SurfaceId(1000));
+    }
+
+    #[test]
+    fn snapshot_preserves_latest_unread_target_and_surface_unread_metadata() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let surface_id = app.selected_pane().unwrap().selected_surface;
+        app.mark_surface_unread(surface_id, "Build finished".to_string())
+            .unwrap();
+
+        let restored = AppSnapshot::from_model(&app)
+            .to_json_string()
+            .and_then(|json| AppSnapshot::from_json_str(&json))
+            .and_then(AppSnapshot::into_model)
+            .unwrap();
+
+        let target = restored.latest_unread_target.as_ref().unwrap();
+        assert_eq!(target.surface_id, surface_id);
+        assert_eq!(target.message, "Build finished");
+        assert_eq!(target.sequence, 1);
+        assert_eq!(restored.next_unread_sequence, 2);
+        let surface = restored
+            .selected_pane()
+            .unwrap()
+            .surface(surface_id)
+            .unwrap();
+        assert_eq!(surface.unread_message, Some("Build finished".to_string()));
+        assert_eq!(surface.unread_sequence, Some(1));
+    }
+
+    #[test]
+    fn restore_replaces_selected_browser_surface_with_terminal_surface() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let browser = app
+            .open_browser_surface("https://example.com".to_string())
+            .unwrap();
+        let restored = AppSnapshot::from_model(&app).into_model().unwrap();
+
+        let pane = restored.selected_pane().unwrap();
+        assert_ne!(pane.selected_surface, browser);
+        assert_eq!(
+            pane.surface(pane.selected_surface).unwrap().kind,
+            SurfaceKind::Terminal
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_multiple_unread_surface_ordering() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let first = app.selected_pane().unwrap().selected_surface;
+        let second = app.open_terminal_surface().unwrap();
+        app.mark_surface_unread(first, "First".to_string()).unwrap();
+        app.mark_surface_unread(second, "Second".to_string())
+            .unwrap();
+
+        let mut restored = AppSnapshot::from_model(&app).into_model().unwrap();
+
+        let target = restored.latest_unread_target.as_ref().unwrap();
+        assert_eq!(target.surface_id, second);
+        assert_eq!(target.sequence, 2);
+        restored.mark_surface_read(second).unwrap();
+        let fallback = restored.latest_unread_target.as_ref().unwrap();
+        assert_eq!(fallback.surface_id, first);
+        assert_eq!(fallback.sequence, 1);
+    }
+
+    #[test]
+    fn v1_snapshot_migrates_to_v2_defaults() {
+        let json = r#"{
+  "schema_version": 1,
+  "selected_window": 1,
+  "windows": [
+    {
+      "id": 1,
+      "selected_workspace": 2,
+      "workspaces": [
+        {
+          "id": 2,
+          "title": "alpha",
+          "cwd": "C:/work/alpha",
+          "selected_pane": 3,
+          "layout": { "type": "leaf", "pane": 3 },
+          "unread": false,
+          "latest_notification": null,
+          "panes": [
+            {
+              "id": 3,
+              "cwd": "C:/work/alpha",
+              "selected_surface": 4,
+              "surfaces": [
+                { "id": 4, "kind": "terminal", "title": "Terminal", "unread": false }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}"#;
+
+        let snapshot = AppSnapshot::from_json_str(json).unwrap();
+
+        assert_eq!(snapshot.schema_version, 2);
+        assert_eq!(snapshot.latest_unread_target, None);
+        assert_eq!(snapshot.next_unread_sequence, 1);
+        assert_eq!(
+            snapshot.windows[0].workspaces[0].panes[0].surfaces[0].unread_message,
+            None
+        );
+        assert_eq!(
+            snapshot.windows[0].workspaces[0].panes[0].surfaces[0].unread_sequence,
+            None
+        );
+    }
+
+    #[test]
+    fn restore_reports_missing_required_collections() {
+        let missing_window = r#"{"schema_version":2,"selected_window":1,"latest_unread_target":null,"next_unread_sequence":1,"windows":[]}"#;
+        assert!(matches!(
+            AppSnapshot::from_json_str(missing_window)
+                .unwrap()
+                .into_model(),
+            Err(SessionError::MissingSelectedWindow)
+        ));
+
+        let missing_workspace = r#"{"schema_version":2,"selected_window":1,"latest_unread_target":null,"next_unread_sequence":1,"windows":[{"id":1,"selected_workspace":2,"workspaces":[]}]}"#;
+        assert!(matches!(
+            AppSnapshot::from_json_str(missing_workspace)
+                .unwrap()
+                .into_model(),
+            Err(SessionError::MissingSelectedWorkspace)
+        ));
+
+        let missing_pane = r#"{"schema_version":2,"selected_window":1,"latest_unread_target":null,"next_unread_sequence":1,"windows":[{"id":1,"selected_workspace":2,"workspaces":[{"id":2,"title":"alpha","cwd":"C:/work/alpha","selected_pane":3,"layout":{"type":"leaf","pane":3},"unread":false,"latest_notification":null,"panes":[]}]}]}"#;
+        assert!(matches!(
+            AppSnapshot::from_json_str(missing_pane)
+                .unwrap()
+                .into_model(),
+            Err(SessionError::MissingSelectedPane)
+        ));
+
+        let missing_surface = r#"{"schema_version":2,"selected_window":1,"latest_unread_target":null,"next_unread_sequence":1,"windows":[{"id":1,"selected_workspace":2,"workspaces":[{"id":2,"title":"alpha","cwd":"C:/work/alpha","selected_pane":3,"layout":{"type":"leaf","pane":3},"unread":false,"latest_notification":null,"panes":[{"id":3,"cwd":"C:/work/alpha","selected_surface":4,"surfaces":[]}]}]}]}"#;
+        assert!(matches!(
+            AppSnapshot::from_json_str(missing_surface)
+                .unwrap()
+                .into_model(),
+            Err(SessionError::MissingSelectedSurface)
+        ));
+    }
+
+    #[test]
+    fn snapshot_json_uses_stable_v2_wire_contract() {
         let mut app = AppModel::new("C:/work/alpha");
         app.split_selected_pane(SplitAxis::Vertical).unwrap();
         app.open_browser_surface("https://example.com".to_string())
@@ -335,8 +858,14 @@ mod tests {
         let json = AppSnapshot::from_model(&app).to_json_string().unwrap();
         let value: Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["selected_window"], 1);
+        assert_eq!(value["latest_unread_target"]["workspace_id"], 2);
+        assert_eq!(value["latest_unread_target"]["pane_id"], 5);
+        assert_eq!(value["latest_unread_target"]["surface_id"], 7);
+        assert_eq!(value["latest_unread_target"]["message"], "Browser updated");
+        assert_eq!(value["latest_unread_target"]["sequence"], 1);
+        assert_eq!(value["next_unread_sequence"], 2);
 
         let window = &value["windows"][0];
         assert_eq!(window["id"], 1);
@@ -372,5 +901,7 @@ mod tests {
         assert_eq!(browser_surface["id"], 7);
         assert_eq!(browser_surface["title"], "https://example.com");
         assert_eq!(browser_surface["unread"], true);
+        assert_eq!(browser_surface["unread_message"], "Browser updated");
+        assert_eq!(browser_surface["unread_sequence"], 1);
     }
 }
