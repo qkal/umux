@@ -1,173 +1,128 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #[cfg(windows)]
-use std::borrow::Cow;
-#[cfg(windows)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::thread::JoinHandle;
+#[cfg(windows)]
+use std::time::Duration;
 
 #[cfg(windows)]
-use alacritty_terminal::event::WindowSize;
+use crossbeam_channel::{Receiver, Sender};
 #[cfg(windows)]
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
-#[cfg(windows)]
-use alacritty_terminal::grid::Dimensions;
-#[cfg(windows)]
-use alacritty_terminal::sync::FairMutex;
-#[cfg(windows)]
-use alacritty_terminal::term::{Config, Term};
+use umux_notify::TerminalNotification;
 
-#[cfg(windows)]
-use crate::emulator::{TerminalDimensions, snapshot_from_term};
 #[cfg(windows)]
 use crate::pty::clamp_pty_size;
 #[cfg(windows)]
 use crate::{
-    AlacrittyPtyBackend, PtyError, PtySpawnConfig, TerminalEventSink, TerminalHealth,
-    TerminalPalette, TerminalRendererSnapshot, TerminalStatus,
+    AlacrittyPtyBackend, PtyBackend, PtyError, PtySpawnConfig, TerminalHealth,
+    TerminalRendererSnapshot, TerminalSession, TerminalSessionConfig, TerminalStatus,
 };
 
 #[cfg(windows)]
-type LiveEventLoop = EventLoop<alacritty_terminal::tty::Pty, TerminalEventSink>;
-#[cfg(windows)]
-type LiveThread = JoinHandle<(LiveEventLoop, State)>;
+pub struct LiveTerminalSession {
+    tx: Sender<LiveCommand>,
+    state: Arc<Mutex<LiveState>>,
+    alive: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
 
 #[cfg(windows)]
-pub struct LiveTerminalSession {
-    terminal: Arc<FairMutex<Term<TerminalEventSink>>>,
-    palette: TerminalPalette,
-    sender: EventLoopSender,
-    thread: Mutex<Option<LiveThread>>,
-    shell: String,
-    cwd: String,
-    size: Mutex<(u16, u16)>,
-    version: AtomicU64,
-    bytes_read: AtomicU64,
-    bytes_written: AtomicU64,
-    last_visible_text_len: AtomicU64,
-    last_error: Mutex<Option<String>>,
+#[derive(Debug)]
+enum LiveCommand {
+    Input(Vec<u8>),
+    Resize(u16, u16),
+    Shutdown,
+}
+
+#[cfg(windows)]
+struct LiveState {
+    snapshot: TerminalRendererSnapshot,
+    health: TerminalHealth,
+    notifications: Vec<TerminalNotification>,
 }
 
 #[cfg(windows)]
 impl LiveTerminalSession {
     pub fn spawn(config: PtySpawnConfig) -> Result<Self, PtyError> {
         let (cols, rows) = clamp_pty_size(config.cols, config.rows);
-        let dimensions = TerminalDimensions::new(cols, rows);
-        let sink = TerminalEventSink::default();
-        let term_config = Config {
-            scrolling_history: 10_000,
-            ..Default::default()
-        };
-        let terminal = Arc::new(FairMutex::new(Term::new(
-            term_config,
-            &dimensions,
-            sink.clone(),
-        )));
-        let pty = AlacrittyPtyBackend::spawn_raw(config.clone())?;
-        let event_loop =
-            EventLoop::new(terminal.clone(), sink, pty, false, false).map_err(io_error)?;
-        let sender = event_loop.channel();
-        let thread = event_loop.spawn();
+        let backend = AlacrittyPtyBackend::spawn(config.clone())?;
+        let session_config =
+            TerminalSessionConfig::new(config.shell.clone(), config.cwd.clone(), cols, rows);
+        let mut session = TerminalSession::from_backend(session_config, backend);
+        let state = Arc::new(Mutex::new(LiveState {
+            snapshot: session.snapshot(),
+            health: session.health(),
+            notifications: Vec::new(),
+        }));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let thread_state = state.clone();
+        let thread_alive = alive.clone();
+        let thread = std::thread::Builder::new()
+            .name("umux-terminal-live".to_string())
+            .spawn(move || run_live_pump(&mut session, rx, thread_state, thread_alive))
+            .map_err(|error| PtyError::Io(error.to_string()))?;
 
         Ok(Self {
-            terminal,
-            palette: TerminalPalette::default(),
-            sender,
+            tx,
+            state,
+            alive,
             thread: Mutex::new(Some(thread)),
-            shell: config.shell.program,
-            cwd: config.cwd,
-            size: Mutex::new((cols, rows)),
-            version: AtomicU64::new(0),
-            bytes_read: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
-            last_visible_text_len: AtomicU64::new(0),
-            last_error: Mutex::new(None),
         })
     }
 
     pub fn send_input(&self, input: impl AsRef<[u8]>) -> Result<(), PtyError> {
-        let input = input.as_ref();
-        self.sender
-            .send(Msg::Input(Cow::Owned(input.to_vec())))
-            .map_err(|error| self.record_error(error))?;
-        self.bytes_written
-            .fetch_add(input.len() as u64, Ordering::Relaxed);
-        self.version.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        self.tx
+            .send(LiveCommand::Input(input.as_ref().to_vec()))
+            .map_err(channel_error)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
-        let window_size = window_size(cols, rows);
-        self.sender
-            .send(Msg::Resize(window_size))
-            .map_err(|error| self.record_error(error))?;
-        apply_resize_state(&self.terminal, &self.size, &self.version, cols, rows);
-        Ok(())
+        self.tx
+            .send(LiveCommand::Resize(cols, rows))
+            .map_err(channel_error)
     }
 
     pub fn snapshot(&self) -> TerminalRendererSnapshot {
-        let term = self.terminal.lock();
-        let version = self.version.fetch_add(1, Ordering::Relaxed);
-        let snapshot = snapshot_from_term(&term, &self.palette, version);
-        update_visible_text_estimate(
-            &self.last_visible_text_len,
-            &self.bytes_read,
-            snapshot.visible_text().len() as u64,
-        );
-        snapshot
+        self.state
+            .lock()
+            .expect("terminal state lock poisoned")
+            .snapshot
+            .clone()
     }
 
     pub fn health(&self) -> TerminalHealth {
-        let (cols, rows) = *self.size.lock().expect("terminal size lock poisoned");
-        let status = if self.is_alive() {
-            TerminalStatus::Running
-        } else {
-            TerminalStatus::Exited
-        };
-        let scrollback_lines = self.terminal.lock().grid().history_size();
+        self.state
+            .lock()
+            .expect("terminal state lock poisoned")
+            .health
+            .clone()
+    }
 
-        TerminalHealth {
-            shell: self.shell.clone(),
-            cwd: self.cwd.clone(),
-            status,
-            cols,
-            rows,
-            scrollback_lines,
-            bytes_read: self.bytes_read.load(Ordering::Relaxed),
-            bytes_written: self.bytes_written.load(Ordering::Relaxed),
-            last_error: self
-                .last_error
+    pub fn drain_notifications(&self) -> Vec<TerminalNotification> {
+        std::mem::take(
+            &mut self
+                .state
                 .lock()
-                .expect("terminal error lock poisoned")
-                .clone(),
-        }
+                .expect("terminal state lock poisoned")
+                .notifications,
+        )
     }
 
     pub fn is_alive(&self) -> bool {
-        self.thread
-            .lock()
-            .expect("terminal thread lock poisoned")
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
-    }
-
-    fn record_error(&self, error: impl std::fmt::Display) -> PtyError {
-        let message = error.to_string();
-        *self
-            .last_error
-            .lock()
-            .expect("terminal error lock poisoned") = Some(message.clone());
-        PtyError::Io(message)
+        self.alive.load(Ordering::Relaxed)
     }
 }
 
 #[cfg(windows)]
 impl Drop for LiveTerminalSession {
     fn drop(&mut self) {
-        let _ = self.sender.send(Msg::Shutdown);
+        let _ = self.tx.send(LiveCommand::Shutdown);
+        self.alive.store(false, Ordering::Relaxed);
         if let Some(thread) = self
             .thread
             .lock()
@@ -175,7 +130,7 @@ impl Drop for LiveTerminalSession {
             .take()
         {
             let _ = std::thread::Builder::new()
-                .name("PTY shutdown join".to_string())
+                .name("umux-terminal-live-join".to_string())
                 .spawn(move || {
                     let _ = thread.join();
                 });
@@ -184,98 +139,195 @@ impl Drop for LiveTerminalSession {
 }
 
 #[cfg(windows)]
-fn apply_resize_state(
-    terminal: &Arc<FairMutex<Term<TerminalEventSink>>>,
-    size: &Mutex<(u16, u16)>,
-    version: &AtomicU64,
-    cols: u16,
-    rows: u16,
-) -> WindowSize {
-    let window_size = window_size(cols, rows);
-    terminal.lock().resize(TerminalDimensions::new(
-        window_size.num_cols,
-        window_size.num_lines,
-    ));
-    *size.lock().expect("terminal size lock poisoned") =
-        (window_size.num_cols, window_size.num_lines);
-    version.fetch_add(1, Ordering::Relaxed);
-    window_size
-}
-
-#[cfg(windows)]
-fn update_visible_text_estimate(
-    last_visible_text_len: &AtomicU64,
-    bytes_read: &AtomicU64,
-    current_len: u64,
+fn run_live_pump<B: PtyBackend>(
+    session: &mut TerminalSession<B>,
+    rx: Receiver<LiveCommand>,
+    state: Arc<Mutex<LiveState>>,
+    alive: Arc<AtomicBool>,
 ) {
-    // Alacritty's event loop owns PTY reads, so live health reports visible-text growth.
-    let previous = last_visible_text_len.swap(current_len, Ordering::Relaxed);
-    if current_len > previous {
-        bytes_read.fetch_add(current_len - previous, Ordering::Relaxed);
+    while alive.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(LiveCommand::Input(input)) => {
+                let _ = session.write_input(input);
+            }
+            Ok(LiveCommand::Resize(cols, rows)) => {
+                let _ = session.resize(cols, rows);
+            }
+            Ok(LiveCommand::Shutdown) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+
+        match session.pump_once() {
+            Ok(notifications) => update_live_state(session, &state, notifications),
+            Err(_) => update_live_state(session, &state, Vec::new()),
+        }
+
+        if matches!(
+            session.health().status,
+            TerminalStatus::Exited | TerminalStatus::Failed
+        ) {
+            break;
+        }
     }
+
+    alive.store(false, Ordering::Relaxed);
+    update_live_state(session, &state, Vec::new());
 }
 
 #[cfg(windows)]
-fn window_size(cols: u16, rows: u16) -> WindowSize {
-    let (cols, rows) = clamp_pty_size(cols, rows);
-
-    WindowSize {
-        num_lines: rows,
-        num_cols: cols,
-        cell_width: 0,
-        cell_height: 0,
-    }
+fn update_live_state<B: PtyBackend>(
+    session: &TerminalSession<B>,
+    state: &Arc<Mutex<LiveState>>,
+    notifications: Vec<TerminalNotification>,
+) {
+    let mut state = state.lock().expect("terminal state lock poisoned");
+    state.snapshot = session.snapshot();
+    state.health = session.health();
+    state.notifications.extend(notifications);
 }
 
 #[cfg(windows)]
-fn io_error(error: std::io::Error) -> PtyError {
+fn channel_error(error: impl std::fmt::Display) -> PtyError {
     PtyError::Io(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
 
     #[cfg(windows)]
     #[test]
-    fn window_size_clamps_to_conpty_safe_dimensions() {
-        let size = window_size(0, u16::MAX);
+    fn live_state_drains_notifications_once() {
+        let mut emulator = crate::TerminalEmulator::new(5, 2, 100);
+        let notification = emulator.feed_bytes(b"\x1b]9;ready\x07").remove(0);
+        let state = Arc::new(Mutex::new(LiveState {
+            snapshot: emulator.snapshot(),
+            health: TerminalHealth::running("pwsh", "C:/work/alpha", 5, 2),
+            notifications: vec![notification.clone()],
+        }));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let session = LiveTerminalSession {
+            tx,
+            state,
+            alive: Arc::new(AtomicBool::new(true)),
+            thread: Mutex::new(None),
+        };
 
-        assert_eq!(size.num_cols, 1);
-        assert_eq!(size.num_lines, i16::MAX as u16);
+        assert_eq!(session.drain_notifications(), vec![notification]);
+        assert!(session.drain_notifications().is_empty());
     }
 
     #[cfg(windows)]
     #[test]
-    fn resize_state_updates_terminal_snapshot_dimensions() {
-        let dimensions = TerminalDimensions::new(80, 24);
-        let sink = TerminalEventSink::default();
-        let terminal = Arc::new(FairMutex::new(Term::new(
-            Config::default(),
-            &dimensions,
-            sink,
-        )));
-        let size = Mutex::new((80, 24));
-        let version = AtomicU64::new(0);
+    fn live_pump_stops_and_marks_state_exited_when_child_exits() {
+        let mut session = TerminalSession::from_backend(
+            TerminalSessionConfig::new(
+                crate::ResolvedShell {
+                    program: "pwsh".to_string(),
+                    args: Vec::new(),
+                    attempted: vec!["pwsh".to_string()],
+                    used_last_resort: false,
+                },
+                "C:/work/alpha",
+                5,
+                2,
+            ),
+            ExitPtyBackend,
+        );
+        let state = Arc::new(Mutex::new(LiveState {
+            snapshot: session.snapshot(),
+            health: session.health(),
+            notifications: Vec::new(),
+        }));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (_tx, rx) = crossbeam_channel::unbounded();
 
-        apply_resize_state(&terminal, &size, &version, u16::MAX, 10);
+        run_live_pump(&mut session, rx, state.clone(), alive.clone());
 
-        let snapshot = snapshot_from_term(&terminal.lock(), &TerminalPalette::default(), 0);
-        assert_eq!(snapshot.cols, i16::MAX as u16);
-        assert_eq!(snapshot.rows, 10);
-        assert_eq!(*size.lock().unwrap(), (i16::MAX as u16, 10));
+        assert!(!alive.load(Ordering::Relaxed));
+        assert_eq!(
+            state.lock().unwrap().health.status,
+            crate::TerminalStatus::Exited
+        );
     }
 
     #[cfg(windows)]
     #[test]
-    fn visible_text_estimate_counts_growth_only() {
-        let previous = AtomicU64::new(0);
-        let total = AtomicU64::new(0);
+    fn live_pump_stops_and_marks_state_failed_when_backend_errors() {
+        let mut session = TerminalSession::from_backend(
+            TerminalSessionConfig::new(
+                crate::ResolvedShell {
+                    program: "pwsh".to_string(),
+                    args: Vec::new(),
+                    attempted: vec!["pwsh".to_string()],
+                    used_last_resort: false,
+                },
+                "C:/work/alpha",
+                5,
+                2,
+            ),
+            ErrorPtyBackend,
+        );
+        let state = Arc::new(Mutex::new(LiveState {
+            snapshot: session.snapshot(),
+            health: session.health(),
+            notifications: Vec::new(),
+        }));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (_tx, rx) = crossbeam_channel::unbounded();
 
-        update_visible_text_estimate(&previous, &total, 5);
-        update_visible_text_estimate(&previous, &total, 3);
-        update_visible_text_estimate(&previous, &total, 8);
+        run_live_pump(&mut session, rx, state.clone(), alive.clone());
 
-        assert_eq!(total.load(Ordering::Relaxed), 10);
+        assert!(!alive.load(Ordering::Relaxed));
+        assert_eq!(
+            state.lock().unwrap().health.status,
+            crate::TerminalStatus::Failed
+        );
+    }
+
+    #[cfg(windows)]
+    struct ExitPtyBackend;
+
+    #[cfg(windows)]
+    impl crate::PtyBackend for ExitPtyBackend {
+        fn read_output(&mut self) -> Result<Vec<u8>, PtyError> {
+            Ok(Vec::new())
+        }
+
+        fn write_input(&mut self, _input: &[u8]) -> Result<(), PtyError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _cols: u16, _rows: u16) -> Result<(), PtyError> {
+            Ok(())
+        }
+
+        fn child_exited(&mut self) -> Result<Option<i32>, PtyError> {
+            Ok(Some(0))
+        }
+    }
+
+    #[cfg(windows)]
+    struct ErrorPtyBackend;
+
+    #[cfg(windows)]
+    impl crate::PtyBackend for ErrorPtyBackend {
+        fn read_output(&mut self) -> Result<Vec<u8>, PtyError> {
+            Err(PtyError::Io("read failed".to_string()))
+        }
+
+        fn write_input(&mut self, _input: &[u8]) -> Result<(), PtyError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _cols: u16, _rows: u16) -> Result<(), PtyError> {
+            Ok(())
+        }
+
+        fn child_exited(&mut self) -> Result<Option<i32>, PtyError> {
+            Ok(None)
+        }
     }
 }

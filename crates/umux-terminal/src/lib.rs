@@ -18,7 +18,7 @@ pub use appearance::{
     TerminalAppearance, TerminalColor, TerminalGridSize, TerminalMetrics, TerminalPalette,
 };
 pub use clipboard::{ClipboardError, ClipboardPort, FakeClipboard};
-pub use control::{TerminalControlApi, TerminalControlError};
+pub use control::{TerminalControlApi, TerminalControlError, TerminalDebugInfo};
 pub use emulator::{TerminalEmulator, TerminalEventSink};
 pub use engine::TerminalSurface;
 pub use events::{TerminalEvent, TerminalHealth, TerminalStatus};
@@ -32,6 +32,7 @@ pub use session::{TerminalSession, TerminalSessionConfig};
 pub use shell::{ResolvedShell, ShellResolver};
 pub use snapshot::{TerminalCell, TerminalCursor, TerminalRendererSnapshot, TerminalSelection};
 pub use startup_env::StartupEnvironment;
+pub use umux_notify::TerminalNotification;
 
 pub const CRATE_NAME: &str = "umux-terminal";
 

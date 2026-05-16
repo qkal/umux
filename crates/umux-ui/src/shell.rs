@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::env;
+use std::sync::{Arc, Mutex};
 
 use floem::prelude::*;
 use umux_core::AppModel;
 
-use crate::terminal_view::terminal_view_for_cwd;
+use crate::terminal_view::{TerminalLaunchContext, terminal_view_for_context};
 use crate::theme::{SIDEBAR_WIDTH, SURFACE_TAB_HEIGHT, TOP_BAR_HEIGHT};
 
 const BACKGROUND: Color = Color::rgb8(0x11, 0x13, 0x16);
@@ -43,11 +44,17 @@ fn shell_view(model: AppModel) -> impl IntoView {
     let cwd = workspace
         .map(|workspace| workspace.cwd.clone())
         .unwrap_or_else(|| ".".to_string());
+    let terminal_context = TerminalLaunchContext::from_model(&model)
+        .unwrap_or_else(|_| TerminalLaunchContext::fallback(cwd.clone()));
+    let model = Arc::new(Mutex::new(model));
 
     v_stack((
         top_bar(workspace_title.clone()),
-        h_stack((sidebar(workspace_title), work_area(surface_count, cwd)))
-            .style(|s| s.flex().width_full().height_full()),
+        h_stack((
+            sidebar(workspace_title),
+            work_area(surface_count, terminal_context, model),
+        ))
+        .style(|s| s.flex().width_full().height_full()),
     ))
     .style(|s| s.size_full().background(BACKGROUND).color(TEXT))
 }
@@ -87,7 +94,11 @@ fn sidebar(workspace_title: String) -> impl IntoView {
     })
 }
 
-fn work_area(surface_count: usize, cwd: String) -> impl IntoView {
+fn work_area(
+    surface_count: usize,
+    terminal_context: TerminalLaunchContext,
+    model: Arc<Mutex<AppModel>>,
+) -> impl IntoView {
     let surface_count_label = format!("{surface_count} surface");
 
     v_stack((
@@ -106,7 +117,7 @@ fn work_area(surface_count: usize, cwd: String) -> impl IntoView {
                 .border_bottom(1.0)
                 .border_color(Color::rgb8(0x25, 0x2a, 0x32))
         }),
-        terminal_view_for_cwd(cwd).style(|s| {
+        terminal_view_for_context(terminal_context, Some(model)).style(|s| {
             s.width_full()
                 .height_full()
                 .padding(16.0)

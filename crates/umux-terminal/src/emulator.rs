@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config, Term};
@@ -153,9 +154,56 @@ impl TerminalEmulator {
         self.sink.drain()
     }
 
+    pub fn screen_text(&self, include_scrollback: bool) -> String {
+        screen_text_from_term(&self.term, include_scrollback)
+    }
+
+    pub fn clear_scrollback(&mut self) {
+        self.term.grid_mut().clear_history();
+        self.version = self.version.saturating_add(1);
+    }
+
     pub fn snapshot(&self) -> TerminalRendererSnapshot {
         snapshot_from_term(&self.term, &self.palette, self.version)
     }
+}
+
+pub(crate) fn screen_text_from_term(
+    term: &Term<TerminalEventSink>,
+    include_scrollback: bool,
+) -> String {
+    let grid = term.grid();
+    let cols = term.columns();
+    if cols == 0 {
+        return String::new();
+    }
+
+    let start_line = if include_scrollback {
+        grid.topmost_line().0
+    } else {
+        0
+    };
+    let end_line = grid.bottommost_line().0;
+
+    (start_line..=end_line)
+        .map(|line| {
+            (0..cols)
+                .map(|col| {
+                    let cell = &grid[Line(line)][Column(col)];
+                    if cell.flags.contains(Flags::HIDDEN) {
+                        ' '
+                    } else {
+                        cell.c
+                    }
+                })
+                .collect::<String>()
+                .trim_end_matches(' ')
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_matches('\n')
+        .to_string()
 }
 
 pub(crate) fn snapshot_from_term(

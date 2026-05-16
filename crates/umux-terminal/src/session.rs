@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::{
-    PtyBackend, PtyError, ResolvedShell, TerminalEmulator, TerminalHealth, TerminalRendererSnapshot,
+    PtyBackend, PtyError, ResolvedShell, TerminalEmulator, TerminalHealth,
+    TerminalRendererSnapshot, TerminalStatus,
 };
+use umux_notify::TerminalNotification;
 
 const MAX_SESSION_DIMENSION: u16 = i16::MAX as u16;
 
@@ -48,22 +50,23 @@ impl<B: PtyBackend> TerminalSession<B> {
         }
     }
 
-    pub fn pump_once(&mut self) -> Result<(), PtyError> {
+    pub fn pump_once(&mut self) -> Result<Vec<TerminalNotification>, PtyError> {
         let output = self.backend.read_output().inspect_err(|error| {
             self.record_error(error);
         })?;
         if output.is_empty() {
-            return Ok(());
+            if self.poll_child_exit()?.is_some() {
+                return self.drain_available_output();
+            }
+            return Ok(Vec::new());
         }
 
-        self.health.bytes_read = self
-            .health
-            .bytes_read
-            .saturating_add(u64::try_from(output.len()).unwrap_or(u64::MAX));
-        self.emulator.feed_bytes(&output);
-        self.health.scrollback_lines = self.emulator.snapshot().scrollback_lines as usize;
+        let mut notifications = self.ingest_output(output);
+        if self.poll_child_exit()?.is_some() {
+            notifications.extend(self.drain_available_output()?);
+        }
 
-        Ok(())
+        Ok(notifications)
     }
 
     pub fn write_input(&mut self, input: impl AsRef<[u8]>) -> Result<(), PtyError> {
@@ -99,12 +102,57 @@ impl<B: PtyBackend> TerminalSession<B> {
         self.emulator.snapshot()
     }
 
+    pub fn screen_text(&self, include_scrollback: bool) -> String {
+        self.emulator.screen_text(include_scrollback)
+    }
+
+    pub fn clear_scrollback(&mut self) {
+        self.emulator.clear_scrollback();
+        self.health.scrollback_lines = 0;
+    }
+
     pub fn health(&self) -> TerminalHealth {
         self.health.clone()
     }
 
+    pub fn poll_child_exit(&mut self) -> Result<Option<i32>, PtyError> {
+        let exit = self.backend.child_exited().inspect_err(|error| {
+            self.record_error(error);
+        })?;
+        if exit.is_some() {
+            self.health.status = TerminalStatus::Exited;
+        }
+
+        Ok(exit)
+    }
+
     fn record_error(&mut self, error: &PtyError) {
         self.health.last_error = Some(error.to_string());
+        self.health.status = TerminalStatus::Failed;
+    }
+
+    fn drain_available_output(&mut self) -> Result<Vec<TerminalNotification>, PtyError> {
+        let mut notifications = Vec::new();
+        loop {
+            let output = self.backend.read_output().inspect_err(|error| {
+                self.record_error(error);
+            })?;
+            if output.is_empty() {
+                return Ok(notifications);
+            }
+
+            notifications.extend(self.ingest_output(output));
+        }
+    }
+
+    fn ingest_output(&mut self, output: Vec<u8>) -> Vec<TerminalNotification> {
+        self.health.bytes_read = self
+            .health
+            .bytes_read
+            .saturating_add(u64::try_from(output.len()).unwrap_or(u64::MAX));
+        let notifications = self.emulator.feed_bytes(&output);
+        self.health.scrollback_lines = self.emulator.snapshot().scrollback_lines as usize;
+        notifications
     }
 }
 
@@ -119,6 +167,7 @@ fn clamp_session_size(cols: u16, rows: u16) -> (u16, u16) {
 mod tests {
     use super::*;
     use crate::{FakePtyBackend, ResolvedShell};
+    use std::collections::VecDeque;
 
     #[test]
     fn session_ingests_output_and_updates_snapshot() {
@@ -138,6 +187,93 @@ mod tests {
 
         assert!(session.snapshot().visible_text().contains("hello"));
         assert_eq!(session.health().bytes_read, 7);
+    }
+
+    #[test]
+    fn session_pump_returns_terminal_notifications() {
+        let mut session = TerminalSession::from_backend(
+            TerminalSessionConfig::new(test_shell(), "C:/work/alpha", 80, 24),
+            FakePtyBackend::new("\x1b]9;Build done\x07"),
+        );
+
+        let notifications = session.pump_once().unwrap();
+
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].message, "Build done");
+    }
+
+    #[test]
+    fn session_screen_text_can_include_scrollback() {
+        let mut session = TerminalSession::from_backend(
+            TerminalSessionConfig::new(test_shell(), "C:/work/alpha", 5, 2),
+            FakePtyBackend::new("one\r\ntwo\r\nthree"),
+        );
+        session.pump_once().unwrap();
+
+        assert_eq!(session.screen_text(false), "two\nthree");
+        assert_eq!(session.screen_text(true), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn session_clear_scrollback_preserves_visible_screen() {
+        let mut session = TerminalSession::from_backend(
+            TerminalSessionConfig::new(test_shell(), "C:/work/alpha", 5, 2),
+            FakePtyBackend::new("one\r\ntwo\r\nthree"),
+        );
+        session.pump_once().unwrap();
+
+        session.clear_scrollback();
+
+        assert_eq!(session.screen_text(true), "two\nthree");
+        assert_eq!(session.health().scrollback_lines, 0);
+    }
+
+    #[test]
+    fn session_poll_child_exit_marks_health_exited() {
+        let mut session = TerminalSession::from_backend(
+            TerminalSessionConfig::new(test_shell(), "C:/work/alpha", 80, 24),
+            RecordingPtyBackend::new("").with_child_exit(0),
+        );
+
+        let exit = session.poll_child_exit().unwrap();
+
+        assert_eq!(exit, Some(0));
+        assert_eq!(session.health().status, crate::TerminalStatus::Exited);
+    }
+
+    #[test]
+    fn session_drains_buffered_output_after_child_exit_is_observed() {
+        let mut session = TerminalSession::from_backend(
+            TerminalSessionConfig::new(test_shell(), "C:/work/alpha", 80, 24),
+            ChunkedExitPtyBackend::new([
+                b"first\r\n".to_vec(),
+                b"second\r\n\x1b]9;done\x07".to_vec(),
+            ]),
+        );
+
+        let notifications = session.pump_once().unwrap();
+
+        assert_eq!(session.health().status, crate::TerminalStatus::Exited);
+        assert_eq!(session.health().bytes_read, 24);
+        assert!(session.snapshot().visible_text().contains("first"));
+        assert!(session.snapshot().visible_text().contains("second"));
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].message, "done");
+    }
+
+    #[test]
+    fn session_drains_buffered_output_when_exit_follows_empty_read() {
+        let mut session = TerminalSession::from_backend(
+            TerminalSessionConfig::new(test_shell(), "C:/work/alpha", 80, 24),
+            ChunkedExitPtyBackend::new([Vec::new(), b"late\r\n\x1b]9;late notice\x07".to_vec()]),
+        );
+
+        let notifications = session.pump_once().unwrap();
+
+        assert_eq!(session.health().status, crate::TerminalStatus::Exited);
+        assert!(session.snapshot().visible_text().contains("late"));
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].message, "late notice");
     }
 
     #[test]
@@ -203,6 +339,7 @@ mod tests {
             session.health().last_error,
             Some("pty I/O error: write failed".to_string())
         );
+        assert_eq!(session.health().status, crate::TerminalStatus::Failed);
         assert_eq!(session.health().bytes_read, 0);
         assert_eq!(session.health().bytes_written, 0);
     }
@@ -221,6 +358,7 @@ mod tests {
             session.health().last_error,
             Some("pty I/O error: read failed".to_string())
         );
+        assert_eq!(session.health().status, crate::TerminalStatus::Failed);
         assert_eq!(session.health().bytes_read, 0);
         assert_eq!(session.health().bytes_written, 0);
     }
@@ -239,6 +377,7 @@ mod tests {
             session.health().last_error,
             Some("pty I/O error: resize failed".to_string())
         );
+        assert_eq!(session.health().status, crate::TerminalStatus::Failed);
         assert_eq!(session.health().cols, 80);
         assert_eq!(session.health().rows, 24);
     }
@@ -274,6 +413,7 @@ mod tests {
         read_error: Option<String>,
         write_error: Option<String>,
         resize_error: Option<String>,
+        child_exit: Option<i32>,
     }
 
     impl RecordingPtyBackend {
@@ -286,6 +426,7 @@ mod tests {
                 read_error: None,
                 write_error: None,
                 resize_error: None,
+                child_exit: None,
             }
         }
 
@@ -301,6 +442,11 @@ mod tests {
 
         fn with_resize_error(mut self, message: impl Into<String>) -> Self {
             self.resize_error = Some(message.into());
+            self
+        }
+
+        fn with_child_exit(mut self, status: i32) -> Self {
+            self.child_exit = Some(status);
             self
         }
     }
@@ -334,7 +480,45 @@ mod tests {
         }
 
         fn child_exited(&mut self) -> Result<Option<i32>, PtyError> {
-            Ok(None)
+            Ok(self.child_exit.take())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ChunkedExitPtyBackend {
+        output: VecDeque<Vec<u8>>,
+        child_exit_calls: usize,
+    }
+
+    impl ChunkedExitPtyBackend {
+        fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                output: chunks.into_iter().collect(),
+                child_exit_calls: 0,
+            }
+        }
+    }
+
+    impl PtyBackend for ChunkedExitPtyBackend {
+        fn read_output(&mut self) -> Result<Vec<u8>, PtyError> {
+            Ok(self.output.pop_front().unwrap_or_default())
+        }
+
+        fn write_input(&mut self, _input: &[u8]) -> Result<(), PtyError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _cols: u16, _rows: u16) -> Result<(), PtyError> {
+            Ok(())
+        }
+
+        fn child_exited(&mut self) -> Result<Option<i32>, PtyError> {
+            self.child_exit_calls += 1;
+            if self.child_exit_calls == 1 {
+                Ok(Some(0))
+            } else {
+                Ok(None)
+            }
         }
     }
 }

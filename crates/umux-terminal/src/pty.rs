@@ -7,9 +7,13 @@ use thiserror::Error;
 use crate::ResolvedShell;
 
 #[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
 use std::io::{Read, Write};
 #[cfg(windows)]
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 
@@ -43,6 +47,10 @@ pub trait PtyBackend {
 }
 
 const MAX_PTY_DIMENSION: u16 = i16::MAX as u16;
+#[cfg(windows)]
+const NON_INHERITED_IPC_ENV_KEYS: [&str; 2] = ["UMUX_SOCKET", "CMUX_SOCKET_PATH"];
+#[cfg(windows)]
+static SPAWN_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) fn clamp_pty_size(cols: u16, rows: u16) -> (u16, u16) {
     (
@@ -119,7 +127,7 @@ impl AlacrittyPtyBackend {
             shell: Some(Shell::new(config.shell.program, config.shell.args)),
             working_directory: Some(PathBuf::from(config.cwd)),
             drain_on_exit: false,
-            env: config.env,
+            env: sanitize_terminal_child_env(config.env),
             escape_args: true,
         };
         let window_size = WindowSize {
@@ -129,6 +137,7 @@ impl AlacrittyPtyBackend {
             cell_height: 0,
         };
 
+        let _env_guard = SanitizedParentEnv::new(&NON_INHERITED_IPC_ENV_KEYS);
         tty::new(&options, window_size, 0).map_err(io_error)
     }
 }
@@ -137,7 +146,12 @@ impl AlacrittyPtyBackend {
 impl PtyBackend for AlacrittyPtyBackend {
     fn read_output(&mut self) -> Result<Vec<u8>, PtyError> {
         let mut buf = vec![0; 4096];
-        let read = self.pty.reader().read(&mut buf).map_err(io_error)?;
+        let read = match self.pty.reader().read(&mut buf) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(Vec::new()),
+            Err(error) => return Err(io_error(error)),
+        };
         buf.truncate(read);
         Ok(buf)
     }
@@ -171,6 +185,65 @@ impl PtyBackend for AlacrittyPtyBackend {
 #[cfg(windows)]
 fn io_error(error: std::io::Error) -> PtyError {
     PtyError::Io(error.to_string())
+}
+
+#[cfg(windows)]
+fn sanitize_terminal_child_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
+    env.retain(|key, _| !is_non_inherited_ipc_env_key(key));
+    env
+}
+
+#[cfg(windows)]
+fn is_non_inherited_ipc_env_key(key: &str) -> bool {
+    NON_INHERITED_IPC_ENV_KEYS
+        .iter()
+        .any(|blocked| key.eq_ignore_ascii_case(blocked))
+}
+
+#[cfg(windows)]
+struct SanitizedParentEnv {
+    _guard: MutexGuard<'static, ()>,
+    originals: Vec<(&'static str, Option<OsString>)>,
+}
+
+#[cfg(windows)]
+impl SanitizedParentEnv {
+    fn new(keys: &'static [&'static str]) -> Self {
+        let guard = SPAWN_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("terminal spawn env lock poisoned");
+        let mut originals = Vec::with_capacity(keys.len());
+        for key in keys {
+            originals.push((*key, std::env::var_os(key)));
+            // SAFETY: PTY spawning serializes process-environment mutation with SPAWN_ENV_LOCK and
+            // restores every touched key before releasing the lock.
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+
+        Self {
+            _guard: guard,
+            originals,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SanitizedParentEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.originals.drain(..) {
+            // SAFETY: This restores process environment while SPAWN_ENV_LOCK is still held by self.
+            unsafe {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -244,5 +317,77 @@ mod tests {
         let result: Result<Option<i32>, PtyError> = backend.child_exited();
 
         assert_eq!(result.unwrap(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sanitize_terminal_child_env_removes_reserved_ipc_keys() {
+        let mut env = HashMap::from([
+            ("UMUX_SOCKET".to_string(), "named-pipe".to_string()),
+            ("cmux_socket_path".to_string(), "legacy-pipe".to_string()),
+            ("UMUX_WORKSPACE_ID".to_string(), "2".to_string()),
+        ]);
+
+        env = sanitize_terminal_child_env(env);
+
+        assert!(!env.contains_key("UMUX_SOCKET"));
+        assert!(!env.contains_key("cmux_socket_path"));
+        assert_eq!(env.get("UMUX_WORKSPACE_ID").map(String::as_str), Some("2"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sanitized_parent_env_removes_and_restores_reserved_ipc_keys() {
+        let _umux_restore = TestEnvRestore::set("UMUX_SOCKET", "named-pipe");
+        let _cmux_restore = TestEnvRestore::set("CMUX_SOCKET_PATH", "legacy-pipe");
+
+        {
+            let _guard = SanitizedParentEnv::new(&NON_INHERITED_IPC_ENV_KEYS);
+
+            assert_eq!(std::env::var_os("UMUX_SOCKET"), None);
+            assert_eq!(std::env::var_os("CMUX_SOCKET_PATH"), None);
+        }
+
+        assert_eq!(std::env::var("UMUX_SOCKET").as_deref(), Ok("named-pipe"));
+        assert_eq!(
+            std::env::var("CMUX_SOCKET_PATH").as_deref(),
+            Ok("legacy-pipe")
+        );
+    }
+
+    #[cfg(windows)]
+    struct TestEnvRestore {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    #[cfg(windows)]
+    impl TestEnvRestore {
+        fn set(key: &'static str, value: &'static str) -> Self {
+            let restore = Self {
+                key,
+                original: std::env::var_os(key),
+            };
+            // SAFETY: This test restores the touched variable on drop and uses keys not touched by
+            // other tests except through SanitizedParentEnv, which serializes its own mutation.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            restore
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for TestEnvRestore {
+        fn drop(&mut self) {
+            // SAFETY: This restores the exact process-environment key saved by the test guard.
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
     }
 }
