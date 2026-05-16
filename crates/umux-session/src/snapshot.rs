@@ -73,20 +73,16 @@ impl AppSnapshot {
 
     pub fn into_model(self) -> Result<AppModel, SessionError> {
         let mut max_id = self.max_restored_id();
-        let selected_window = self.selected_window.into();
-        if !self
-            .windows
-            .iter()
-            .any(|window| CoreWindowId::from(window.id) == selected_window)
-        {
+        if self.windows.is_empty() {
             return Err(SessionError::MissingSelectedWindow);
         }
 
-        let latest_unread_target = self.latest_unread_target.map(Into::into);
-        let mut max_unread_sequence = latest_unread_target
+        let snapshot_latest_unread_target = self.latest_unread_target.map(Into::into);
+        let mut max_unread_sequence = snapshot_latest_unread_target
             .as_ref()
             .map(|target: &CoreUnreadTarget| target.sequence)
             .unwrap_or(0);
+        let selected_window_id = self.selected_window.into();
 
         let mut windows = Vec::with_capacity(self.windows.len());
         for window in self.windows {
@@ -168,6 +164,12 @@ impl AppSnapshot {
             });
         }
 
+        let selected_window = if windows.iter().any(|window| window.id == selected_window_id) {
+            selected_window_id
+        } else {
+            windows[0].id
+        };
+        let latest_unread_target = newest_unread_target(&windows);
         let next_unread_sequence = 1
             .max(self.next_unread_sequence)
             .max(max_unread_sequence.saturating_add(1));
@@ -557,11 +559,18 @@ fn reconcile_layout(layout: SnapshotSplitTree, panes: &[Pane]) -> CoreSplitTree 
             axis,
             first,
             second,
-        } => CoreSplitTree::Split {
-            axis: axis.into(),
-            first: repair_pane_id(first.into(), panes, first_valid),
-            second: repair_pane_id(second.into(), panes, first_valid),
-        },
+        } => {
+            let first = existing_pane_id(first.into(), panes);
+            let second = existing_pane_id(second.into(), panes);
+            match (first, second) {
+                (Some(first), Some(second)) if first != second => CoreSplitTree::Split {
+                    axis: axis.into(),
+                    first,
+                    second,
+                },
+                _ => CoreSplitTree::Leaf(first_valid),
+            }
+        }
     }
 }
 
@@ -573,12 +582,36 @@ fn repair_pane_id(id: CorePaneId, panes: &[Pane], fallback: CorePaneId) -> CoreP
     }
 }
 
+fn existing_pane_id(id: CorePaneId, panes: &[Pane]) -> Option<CorePaneId> {
+    panes.iter().any(|pane| pane.id == id).then_some(id)
+}
+
+fn newest_unread_target(windows: &[AppWindow]) -> Option<CoreUnreadTarget> {
+    windows
+        .iter()
+        .flat_map(|window| window.workspaces.iter())
+        .flat_map(|workspace| {
+            workspace.panes.iter().flat_map(move |pane| {
+                pane.surfaces.iter().filter_map(move |surface| {
+                    surface.unread.then_some(CoreUnreadTarget {
+                        workspace_id: workspace.id,
+                        pane_id: pane.id,
+                        surface_id: surface.id,
+                        message: surface.unread_message.clone().unwrap_or_default(),
+                        sequence: surface.unread_sequence.unwrap_or_default(),
+                    })
+                })
+            })
+        })
+        .max_by_key(|target| target.sequence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AppSnapshot, SessionError};
     use serde_json::Value;
     use umux_core::{
-        AppModel, SplitAxis, SurfaceKind,
+        AppModel, SplitAxis, SplitTree, SurfaceKind,
         ids::{PaneId, SurfaceId, WindowId, WorkspaceId},
     };
 
@@ -699,6 +732,109 @@ mod tests {
     }
 
     #[test]
+    fn restore_repairs_missing_selected_window_to_first_window() {
+        let json = r#"{
+  "schema_version": 2,
+  "selected_window": 999,
+  "latest_unread_target": null,
+  "next_unread_sequence": 1,
+  "windows": [
+    {
+      "id": 1,
+      "selected_workspace": 2,
+      "workspaces": [
+        {
+          "id": 2,
+          "title": "alpha",
+          "cwd": "C:/work/alpha",
+          "selected_pane": 3,
+          "layout": { "type": "leaf", "pane": 3 },
+          "unread": false,
+          "latest_notification": null,
+          "panes": [
+            {
+              "id": 3,
+              "cwd": "C:/work/alpha",
+              "selected_surface": 4,
+              "surfaces": [
+                {
+                  "id": 4,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": false,
+                  "unread_message": null,
+                  "unread_sequence": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}"#;
+
+        let model = AppSnapshot::from_json_str(json)
+            .unwrap()
+            .into_model()
+            .unwrap();
+
+        assert_eq!(model.selected_window, WindowId(1));
+    }
+
+    #[test]
+    fn restore_collapses_malformed_split_layout_to_leaf() {
+        let json = r#"{
+  "schema_version": 2,
+  "selected_window": 1,
+  "latest_unread_target": null,
+  "next_unread_sequence": 1,
+  "windows": [
+    {
+      "id": 1,
+      "selected_workspace": 2,
+      "workspaces": [
+        {
+          "id": 2,
+          "title": "alpha",
+          "cwd": "C:/work/alpha",
+          "selected_pane": 3,
+          "layout": { "type": "split", "axis": "vertical", "first": 3, "second": 999 },
+          "unread": false,
+          "latest_notification": null,
+          "panes": [
+            {
+              "id": 3,
+              "cwd": "C:/work/alpha",
+              "selected_surface": 4,
+              "surfaces": [
+                {
+                  "id": 4,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": false,
+                  "unread_message": null,
+                  "unread_sequence": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}"#;
+
+        let model = AppSnapshot::from_json_str(json)
+            .unwrap()
+            .into_model()
+            .unwrap();
+        let workspace = model.selected_workspace().unwrap();
+
+        assert_eq!(workspace.layout, SplitTree::Leaf(PaneId(3)));
+    }
+
+    #[test]
     fn snapshot_preserves_latest_unread_target_and_surface_unread_metadata() {
         let mut app = AppModel::new("C:/work/alpha");
         let surface_id = app.selected_pane().unwrap().selected_surface;
@@ -723,6 +859,75 @@ mod tests {
             .unwrap();
         assert_eq!(surface.unread_message, Some("Build finished".to_string()));
         assert_eq!(surface.unread_sequence, Some(1));
+    }
+
+    #[test]
+    fn restore_recomputes_latest_unread_target_from_surface_metadata() {
+        let json = r#"{
+  "schema_version": 2,
+  "selected_window": 1,
+  "latest_unread_target": {
+    "workspace_id": 2,
+    "pane_id": 3,
+    "surface_id": 4,
+    "message": "Older",
+    "sequence": 1
+  },
+  "next_unread_sequence": 2,
+  "windows": [
+    {
+      "id": 1,
+      "selected_workspace": 2,
+      "workspaces": [
+        {
+          "id": 2,
+          "title": "alpha",
+          "cwd": "C:/work/alpha",
+          "selected_pane": 3,
+          "layout": { "type": "leaf", "pane": 3 },
+          "unread": true,
+          "latest_notification": "Older",
+          "panes": [
+            {
+              "id": 3,
+              "cwd": "C:/work/alpha",
+              "selected_surface": 4,
+              "surfaces": [
+                {
+                  "id": 4,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": true,
+                  "unread_message": "Older",
+                  "unread_sequence": 1
+                },
+                {
+                  "id": 5,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": true,
+                  "unread_message": "Newer",
+                  "unread_sequence": 3
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}"#;
+
+        let restored = AppSnapshot::from_json_str(json)
+            .unwrap()
+            .into_model()
+            .unwrap();
+        let target = restored.latest_unread_target.as_ref().unwrap();
+
+        assert_eq!(target.surface_id, SurfaceId(5));
+        assert_eq!(target.message, "Newer");
+        assert_eq!(target.sequence, 3);
+        assert_eq!(restored.next_unread_sequence, 4);
     }
 
     #[test]
