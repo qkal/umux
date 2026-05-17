@@ -7,7 +7,9 @@ use umux_app::{AppAction, AppController, SessionStore};
 use umux_ui_kit::theme::{BACKGROUND, MUTED_TEXT, PANEL, TEXT};
 
 use crate::actions;
+use crate::shell::{pane_group, top_bar, workspace_rail};
 use crate::startup::StartupState;
+use crate::view_model::workspace_rows;
 
 pub struct UmuxWorkspace {
     pub controller: AppController,
@@ -38,10 +40,10 @@ impl UmuxWorkspace {
         action: umux_app::AppAction,
     ) -> Result<umux_app::AppActionOutcome, umux_app::AppControllerError> {
         let outcome = self.controller.apply(action)?;
-        if outcome.should_save_session {
-            if let Err(error) = self.store.save_model(&self.controller.model) {
-                tracing::warn!(%error, "failed to save session");
-            }
+        if outcome.should_save_session
+            && let Err(error) = self.store.save_model(&self.controller.model)
+        {
+            tracing::warn!(%error, "failed to save session");
         }
         Ok(outcome)
     }
@@ -135,6 +137,44 @@ impl Render for UmuxWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.selected_workspace_title();
         let warning = self.startup_warning.clone();
+        let body = self
+            .controller
+            .model
+            .selected_window()
+            .ok()
+            .map(|window| {
+                let rows = workspace_rows(&window.workspaces, window.selected_workspace);
+                let selected_workspace = window.selected_workspace().cloned();
+
+                div()
+                    .flex()
+                    .flex_1()
+                    .w_full()
+                    .child(workspace_rail(rows))
+                    .child(
+                        selected_workspace
+                            .as_ref()
+                            .map(pane_group)
+                            .unwrap_or_else(|| {
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(MUTED_TEXT)
+                                    .child("missing selected workspace")
+                            }),
+                    )
+            })
+            .unwrap_or_else(|| {
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .text_color(MUTED_TEXT)
+                    .child("missing selected window")
+            });
 
         div()
             .on_action(cx.listener(Self::on_new_workspace))
@@ -149,19 +189,7 @@ impl Render for UmuxWorkspace {
             .size_full()
             .bg(BACKGROUND)
             .text_color(TEXT)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .w_full()
-                    .h(px(40.0))
-                    .px(px(14.0))
-                    .bg(PANEL)
-                    .text_size(px(12.0))
-                    .child(div().font_weight(gpui::FontWeight::BOLD).child("umux"))
-                    .child(div().text_color(MUTED_TEXT).child(title)),
-            )
+            .child(top_bar(title))
             .when_some(warning, |shell, warning| {
                 shell.child(
                     div()
@@ -176,15 +204,7 @@ impl Render for UmuxWorkspace {
                         .child(warning),
                 )
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .text_color(MUTED_TEXT)
-                    .child("GPUI workspace shell"),
-            )
+            .child(body)
     }
 }
 

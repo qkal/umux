@@ -3,6 +3,7 @@
 pub mod actions;
 pub(crate) mod diagnostics;
 pub mod runtime;
+pub mod shell;
 pub mod startup;
 pub mod view_model;
 pub mod workspace;
