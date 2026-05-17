@@ -265,6 +265,20 @@ impl AppModel {
         Ok(())
     }
 
+    pub fn rename_surface(
+        &mut self,
+        surface_id: SurfaceId,
+        title: String,
+    ) -> Result<(), ModelError> {
+        let (window_index, workspace_index, pane_index, surface_index) = self
+            .surface_location(surface_id)
+            .ok_or(ModelError::UnknownSurface(surface_id))?;
+        self.windows[window_index].workspaces[workspace_index].panes[pane_index].surfaces
+            [surface_index]
+            .title = title;
+        Ok(())
+    }
+
     pub fn close_workspace(
         &mut self,
         workspace_id: WorkspaceId,
@@ -752,6 +766,27 @@ mod tests {
         let window = app.selected_window().unwrap();
         assert_eq!(window.workspaces.len(), 1);
         assert_eq!(window.selected_workspace, original);
+    }
+
+    #[test]
+    fn app_can_rename_surface() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let surface_id = app.selected_pane().unwrap().selected_surface;
+
+        app.rename_surface(surface_id, "cargo test".to_string())
+            .unwrap();
+
+        let surface = app.selected_pane().unwrap().surface(surface_id).unwrap();
+        assert_eq!(surface.title, "cargo test");
+    }
+
+    #[test]
+    fn rename_surface_reports_unknown_surface() {
+        let mut app = AppModel::new("C:/work/alpha");
+        let error = app
+            .rename_surface(SurfaceId(999), "x".to_string())
+            .unwrap_err();
+        assert_eq!(error, ModelError::UnknownSurface(SurfaceId(999)));
     }
 
     #[test]

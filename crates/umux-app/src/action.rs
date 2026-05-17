@@ -13,6 +13,10 @@ pub enum AppAction {
         workspace_id: WorkspaceId,
         title: String,
     },
+    RenameSurface {
+        surface_id: SurfaceId,
+        title: String,
+    },
     CloseWorkspace(WorkspaceId),
     SplitPane(SplitAxis),
     ClosePane(PaneId),

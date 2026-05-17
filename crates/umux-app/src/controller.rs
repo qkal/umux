@@ -58,6 +58,9 @@ impl AppController {
             } => {
                 self.model.rename_workspace(workspace_id, title)?;
             }
+            AppAction::RenameSurface { surface_id, title } => {
+                self.model.rename_surface(surface_id, title)?;
+            }
             AppAction::CloseWorkspace(workspace_id) => {
                 let closed_surfaces = self.model.close_workspace(workspace_id)?;
                 self.remove_closed_surfaces(closed_surfaces, &mut outcome);
@@ -242,6 +245,27 @@ mod tests {
         assert_eq!(outcome.spawned_surfaces, vec![surface_id]);
         assert!(controller.terminals.contains(surface_id));
         assert_eq!(controller.terminals.len(), 2);
+    }
+
+    #[test]
+    fn controller_renames_surface() {
+        let mut controller = AppController::new(AppModel::new("C:/work/alpha")).unwrap();
+        let surface_id = controller.model.selected_pane().unwrap().selected_surface;
+
+        controller
+            .apply(AppAction::RenameSurface {
+                surface_id,
+                title: "cargo test".to_string(),
+            })
+            .unwrap();
+
+        let surface = controller
+            .model
+            .selected_pane()
+            .unwrap()
+            .surface(surface_id)
+            .unwrap();
+        assert_eq!(surface.title, "cargo test");
     }
 
     #[test]
