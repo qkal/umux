@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::collections::HashSet;
+
 use thiserror::Error;
 use umux_core::{AppModel, ModelError, PaneId, SurfaceId, SurfaceKind, WorkspaceId};
 
@@ -33,8 +35,24 @@ impl AppController {
         Ok(controller)
     }
 
+    pub fn new_deferred_terminals(model: AppModel) -> Result<Self, AppControllerError> {
+        let controller = Self {
+            model,
+            terminals: TerminalRegistry::new(),
+        };
+        controller.selected_ids()?;
+        controller.validate_terminal_spawn_specs()?;
+        Ok(controller)
+    }
+
     pub fn from_restored_model(model: AppModel) -> Result<Self, AppControllerError> {
         Self::new(model)
+    }
+
+    pub fn from_restored_model_deferred_terminals(
+        model: AppModel,
+    ) -> Result<Self, AppControllerError> {
+        Self::new_deferred_terminals(model)
     }
 
     pub fn apply(&mut self, action: AppAction) -> Result<AppActionOutcome, AppControllerError> {
@@ -117,6 +135,16 @@ impl AppController {
     fn spawn_all_terminal_surfaces(&mut self) -> Result<(), AppControllerError> {
         for spec in self.terminal_spawn_specs() {
             self.terminals.spawn(spec)?;
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_spawn_specs(&self) -> Result<(), AppControllerError> {
+        let mut seen = HashSet::new();
+        for spec in self.terminal_spawn_specs() {
+            if !seen.insert(spec.surface_id) {
+                return Err(TerminalRegistryError::AlreadyRegistered(spec.surface_id).into());
+            }
         }
         Ok(())
     }
@@ -214,7 +242,7 @@ struct SelectedIds {
 mod tests {
     use umux_core::{AppModel, SplitAxis};
 
-    use crate::{AppAction, AppController, AppControllerError};
+    use crate::{AppAction, AppController, AppControllerError, TerminalRegistryError};
 
     #[test]
     fn controller_spawns_initial_terminal() {
@@ -223,6 +251,38 @@ mod tests {
 
         assert!(controller.terminals.contains(surface_id));
         assert_eq!(controller.terminals.len(), 1);
+    }
+
+    #[test]
+    fn deferred_controller_does_not_spawn_initial_terminal() {
+        let controller =
+            AppController::new_deferred_terminals(AppModel::new("C:/work/alpha")).unwrap();
+        let surface_id = controller.model.selected_pane().unwrap().selected_surface;
+
+        assert!(!controller.terminals.contains(surface_id));
+        assert_eq!(controller.terminals.len(), 0);
+    }
+
+    #[test]
+    fn deferred_controller_rejects_duplicate_terminal_surface_ids() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let duplicate_surface = model.selected_pane().unwrap().surfaces[0].clone();
+        let surface_id = duplicate_surface.id;
+        model.split_selected_pane(SplitAxis::Vertical).unwrap();
+        model
+            .selected_pane_mut()
+            .unwrap()
+            .surfaces
+            .push(duplicate_surface);
+
+        let result = AppController::new_deferred_terminals(model);
+
+        match result {
+            Err(AppControllerError::TerminalRegistry(
+                TerminalRegistryError::AlreadyRegistered(duplicate_id),
+            )) => assert_eq!(duplicate_id, surface_id),
+            _ => panic!("expected duplicate terminal surface id error"),
+        }
     }
 
     #[test]

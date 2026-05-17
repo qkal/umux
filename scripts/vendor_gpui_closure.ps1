@@ -29,6 +29,32 @@ function Test-IsUnderPath {
     return $resolvedChild.StartsWith($resolvedParent, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-RelativePathCompat {
+    param(
+        [Parameter(Mandatory = $true)][string]$FromDirectory,
+        [Parameter(Mandatory = $true)][string]$ToPath
+    )
+
+    $fromFull = [System.IO.Path]::GetFullPath($FromDirectory)
+    $toFull = [System.IO.Path]::GetFullPath($ToPath)
+    if (-not $fromFull.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+        $fromFull = "$fromFull$([System.IO.Path]::DirectorySeparatorChar)"
+    }
+
+    $fromUri = [System.Uri]::new($fromFull)
+    $toUri = [System.Uri]::new($toFull)
+    if (-not $fromUri.Scheme.Equals($toUri.Scheme, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cannot compute relative path between '$FromDirectory' and '$ToPath'."
+    }
+
+    $relativePath = [System.Uri]::UnescapeDataString($fromUri.MakeRelativeUri($toUri).ToString())
+    if ($fromUri.Scheme.Equals("file", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $relativePath = $relativePath.Replace("/", [System.IO.Path]::DirectorySeparatorChar)
+    }
+
+    return $relativePath
+}
+
 function Assert-IsUnderPath {
     param(
         [Parameter(Mandatory = $true)][string]$ChildPath,
@@ -86,6 +112,80 @@ function Copy-RootLicenseFiles {
             Copy-Item -LiteralPath $sourceLicense -Destination (Join-Path $DestinationRoot $licenseFile) -Force
         }
     }
+}
+
+function Get-RequiredAssetRows {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][string]$DestinationRoot
+    )
+
+    $assetRelativePaths = @(
+        "assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
+        "assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf",
+        "assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf",
+        "assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf",
+        "assets/fonts/ibm-plex-sans/license.txt",
+        "assets/fonts/lilex/Lilex-Regular.ttf",
+        "assets/fonts/lilex/Lilex-Bold.ttf",
+        "assets/fonts/lilex/Lilex-Italic.ttf",
+        "assets/fonts/lilex/Lilex-BoldItalic.ttf",
+        "assets/fonts/lilex/OFL.txt"
+    )
+
+    foreach ($assetRelativePath in $assetRelativePaths) {
+        [PSCustomObject]@{
+            RelativePath = $assetRelativePath
+            Source = Join-Path $SourceRoot $assetRelativePath
+            Destination = Join-Path $DestinationRoot $assetRelativePath
+        }
+    }
+}
+
+function Copy-RequiredAssets {
+    param(
+        [Parameter(Mandatory = $true)]$AssetRows,
+        [Parameter(Mandatory = $true)][string]$VendorRoot
+    )
+
+    foreach ($assetRow in $AssetRows) {
+        if (-not (Test-Path -LiteralPath $assetRow.Source -PathType Leaf)) {
+            throw "Required GPUI asset '$($assetRow.RelativePath)' was not found at '$($assetRow.Source)'."
+        }
+
+        $destination = [System.IO.Path]::GetFullPath($assetRow.Destination)
+        Assert-IsUnderPath -ChildPath $destination -ParentPath $VendorRoot -Description "Asset destination"
+
+        $destinationParent = Split-Path -Parent $destination
+        New-Item -ItemType Directory -Force -Path $destinationParent | Out-Null
+        Copy-Item -LiteralPath $assetRow.Source -Destination $destination -Force
+    }
+}
+
+function Repair-GpuiMacrosDevDependency {
+    param(
+        [Parameter(Mandatory = $true)][string]$VendorRoot
+    )
+
+    $manifestPath = Join-Path $VendorRoot "crates/gpui_macros/Cargo.toml"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "gpui_macros manifest was not found at '$manifestPath'."
+    }
+
+    $original = Get-Content -LiteralPath $manifestPath -Raw
+    $expected = 'gpui = { workspace = true, features = ["inspector"] }'
+    $replacement = 'gpui = { workspace = true, features = ["inspector", "test-support"] }'
+
+    if ($original.Contains($replacement)) {
+        return
+    }
+
+    if (-not $original.Contains($expected)) {
+        throw "gpui_macros dev-dependency layout changed; expected to find '$expected' in '$manifestPath'."
+    }
+
+    $updated = $original.Replace($expected, $replacement)
+    Set-Content -LiteralPath $manifestPath -Value $updated -Encoding UTF8
 }
 
 function Assert-LicensePointersResolve {
@@ -150,7 +250,7 @@ function Repair-LicensePointersToVendorRoot {
             continue
         }
 
-        $relativeTarget = [System.IO.Path]::GetRelativePath($licenseFile.DirectoryName, $vendorRootTarget) -replace "\\", "/"
+        $relativeTarget = (Get-RelativePathCompat -FromDirectory $licenseFile.DirectoryName -ToPath $vendorRootTarget) -replace "\\", "/"
         Set-Content -LiteralPath $licenseFile.FullName -Value $relativeTarget -NoNewline -Encoding UTF8
     }
 }
@@ -259,12 +359,25 @@ $selectedRows = foreach ($package in ($selectedPackagesByName.Values | Sort-Obje
     }
 }
 
+$assetRows = Get-RequiredAssetRows -SourceRoot $ZedRoot -DestinationRoot (Join-Path $RepoRoot "vendor/gpui")
+
 if ($DryRun) {
     foreach ($row in $selectedRows) {
         Write-Host "Would copy $($row.Crate) from $($row.Source) to $($row.Destination)"
     }
 
+    foreach ($assetRow in $assetRows) {
+        if (Test-Path -LiteralPath $assetRow.Source -PathType Leaf) {
+            Write-Host "Would copy asset $($assetRow.RelativePath) from $($assetRow.Source) to $($assetRow.Destination)"
+        } else {
+            Write-Host "Missing required asset $($assetRow.RelativePath) at $($assetRow.Source)"
+        }
+    }
+
+    Write-Host "Would enable gpui test-support for gpui_macros doctests in vendor/gpui/crates/gpui_macros/Cargo.toml"
+
     $selectedRows | Format-Table -AutoSize
+    $assetRows | Select-Object RelativePath, Source, Destination | Format-Table -AutoSize
     return
 }
 
@@ -280,6 +393,7 @@ New-Item -ItemType Directory -Force -Path $vendorCrateRoot | Out-Null
 $resolvedVendorCrateRoot = Resolve-ExistingPath $vendorCrateRoot
 
 Copy-RootLicenseFiles -SourceRoot $ZedRoot -DestinationRoot $vendorRoot
+Copy-RequiredAssets -AssetRows $assetRows -VendorRoot $vendorRoot
 
 foreach ($row in $selectedRows) {
     $destination = [System.IO.Path]::GetFullPath($row.Destination)
@@ -302,11 +416,22 @@ foreach ($row in $selectedRows) {
     }
 }
 
+Repair-GpuiMacrosDevDependency -VendorRoot $vendorRoot
 Repair-LicensePointersToVendorRoot -CrateRoot $resolvedVendorCrateRoot -VendorRoot $vendorRoot
 Assert-LicensePointersResolve -CrateRoot $resolvedVendorCrateRoot
 
 $readmeRows = foreach ($row in $selectedRows) {
     "| $($row.Crate) | $($row.RelativeSource) | $($row.License) |"
+}
+
+$assetReadmeRows = foreach ($assetRow in $assetRows) {
+    $license = switch -Wildcard ($assetRow.RelativePath) {
+        "assets/fonts/lilex/*" { "SIL Open Font License 1.1" }
+        "assets/fonts/ibm-plex-sans/*" { "SIL Open Font License 1.1" }
+        default { "see source asset license" }
+    }
+
+    "| $($assetRow.RelativePath) | $license |"
 }
 
 $readme = @(
@@ -318,9 +443,27 @@ $readme = @(
     "",
     "| Crate | Source | License |",
     "| --- | --- | --- |"
-) + $readmeRows
+) + $readmeRows + @(
+    "",
+    "## Non-Crate Assets",
+    "",
+    "GPUI tests, examples, and web platform code embed the following font assets from `zed/assets/fonts`. Keep the adjacent font license files with the font files when regenerating the vendor closure.",
+    "",
+    "| Asset | License |",
+    "| --- | --- |"
+) + $assetReadmeRows + @(
+    "",
+    "## Workspace Dependency Resolutions",
+    "",
+    "- `windows`: umux previously used `0.62.2`; GPUI/Zed uses `0.61` with the full Zed feature set. The workspace dependency now follows Zed. `cargo check -p umux-win32` passed without adding a crate-local override; `webview2-com` still brings `windows 0.62.2` transitively where it needs it.",
+    "- GPUI-facing shared dependencies now follow the Zed workspace specs where they differed from umux: `anyhow = 1.0.86`, `serde = 1.0.221` with `derive` and `rc`, `serde_json = 1.0.144` with `preserve_order` and `raw_value`, `thiserror = 2.0.12`, and `tracing = 0.1.40`.",
+    "- `wgpu` follows Zed's fork and is pinned to the Zed-tested `v29` revision `a466bc382ea747f8e1ac810efdb6dcd49a514575` instead of floating on the branch.",
+    "- `reqwest_client` and `http_client_tls` are vendored support crates because GPUI dev-dependencies inherit them from the workspace even though the smoke app does not compile those dev targets.",
+    "- `gpui_macros` keeps doctests enabled like Zed, but its vendored dev-dependency enables GPUI's `test-support` feature so `cargo test --workspace` has the proptest helpers exported during doctest compilation."
+)
 
 $readmePath = Join-Path $vendorRoot "README.md"
 Set-Content -LiteralPath $readmePath -Value $readme -Encoding UTF8
 
 $selectedRows | Format-Table -AutoSize
+$assetRows | Select-Object RelativePath, Source, Destination | Format-Table -AutoSize

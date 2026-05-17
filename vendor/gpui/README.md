@@ -32,9 +32,27 @@ Source revision: 3bd9d13b63fc5a5ffa39326597bc4fd91adc82d1
 | ztracing | crates/ztracing | GPL-3.0-or-later |
 | ztracing_macro | crates/ztracing_macro | GPL-3.0-or-later |
 
+## Non-Crate Assets
+
+GPUI tests, examples, and web platform code embed the following font assets from `zed/assets/fonts`. Keep the adjacent font license files with the font files when regenerating the vendor closure.
+
+| Asset | License |
+| --- | --- |
+| assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf | SIL Open Font License 1.1 |
+| assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf | SIL Open Font License 1.1 |
+| assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf | SIL Open Font License 1.1 |
+| assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf | SIL Open Font License 1.1 |
+| assets/fonts/ibm-plex-sans/license.txt | SIL Open Font License 1.1 |
+| assets/fonts/lilex/Lilex-Regular.ttf | SIL Open Font License 1.1 |
+| assets/fonts/lilex/Lilex-Bold.ttf | SIL Open Font License 1.1 |
+| assets/fonts/lilex/Lilex-Italic.ttf | SIL Open Font License 1.1 |
+| assets/fonts/lilex/Lilex-BoldItalic.ttf | SIL Open Font License 1.1 |
+| assets/fonts/lilex/OFL.txt | SIL Open Font License 1.1 |
+
 ## Workspace Dependency Resolutions
 
 - `windows`: umux previously used `0.62.2`; GPUI/Zed uses `0.61` with the full Zed feature set. The workspace dependency now follows Zed. `cargo check -p umux-win32` passed without adding a crate-local override; `webview2-com` still brings `windows 0.62.2` transitively where it needs it.
 - GPUI-facing shared dependencies now follow the Zed workspace specs where they differed from umux: `anyhow = 1.0.86`, `serde = 1.0.221` with `derive` and `rc`, `serde_json = 1.0.144` with `preserve_order` and `raw_value`, `thiserror = 2.0.12`, and `tracing = 0.1.40`.
 - `wgpu` follows Zed's fork and is pinned to the Zed-tested `v29` revision `a466bc382ea747f8e1ac810efdb6dcd49a514575` instead of floating on the branch.
 - `reqwest_client` and `http_client_tls` are vendored support crates because GPUI dev-dependencies inherit them from the workspace even though the smoke app does not compile those dev targets.
+- `gpui_macros` keeps doctests enabled like Zed, but its vendored dev-dependency enables GPUI's `test-support` feature so `cargo test --workspace` has the proptest helpers exported during doctest compilation.
