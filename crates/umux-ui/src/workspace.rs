@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use gpui::{Context, IntoElement, Render, Window, div, prelude::*, px};
-use umux_app::{AppAction, AppController, SessionStore};
+use gpui::{Context, IntoElement, Render, Task, Window, div, prelude::*, px};
+use umux_app::{AppAction, AppController, SessionStore, TerminalEntry, TerminalEntrySnapshot};
+use umux_core::{SurfaceId, SurfaceKind};
+use umux_terminal::TerminalStatus;
 use umux_ui_kit::theme::{BACKGROUND, MUTED_TEXT, PANEL, TEXT};
 
 use crate::actions;
@@ -15,15 +17,32 @@ pub struct UmuxWorkspace {
     pub controller: AppController,
     pub store: Arc<SessionStore>,
     pub startup_warning: Option<String>,
+    terminal_refresh_state: Vec<TerminalRefreshEntry>,
+    _terminal_refresh_task: Option<Task<()>>,
 }
 
 impl UmuxWorkspace {
     pub fn new(startup: StartupState, store: SessionStore) -> Self {
-        Self {
+        let mut workspace = Self {
             controller: startup.controller,
             store: Arc::new(store),
             startup_warning: startup.warning,
-        }
+            terminal_refresh_state: Vec::new(),
+            _terminal_refresh_task: None,
+        };
+        workspace.materialize_visible_terminals();
+        workspace.terminal_refresh_state = workspace.terminal_refresh_state();
+        workspace
+    }
+
+    pub fn new_with_context(
+        startup: StartupState,
+        store: SessionStore,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut workspace = Self::new(startup, store);
+        workspace.start_terminal_refresh_task(cx);
+        workspace
     }
 
     pub fn selected_workspace_title(&self) -> String {
@@ -40,6 +59,7 @@ impl UmuxWorkspace {
         action: umux_app::AppAction,
     ) -> Result<umux_app::AppActionOutcome, umux_app::AppControllerError> {
         let outcome = self.controller.apply(action)?;
+        self.materialize_visible_terminals();
         if outcome.should_save_session
             && let Err(error) = self.store.save_model(&self.controller.model)
         {
@@ -53,6 +73,52 @@ impl UmuxWorkspace {
             tracing::warn!(%error, "failed to dispatch workspace action");
         }
         cx.notify();
+    }
+
+    fn materialize_visible_terminals(&mut self) {
+        if let Err(error) = self.controller.materialize_visible_terminal_surfaces() {
+            tracing::warn!(%error, "failed to materialize visible terminal surfaces");
+        }
+    }
+
+    fn start_terminal_refresh_task(&mut self, cx: &mut Context<Self>) {
+        self._terminal_refresh_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+
+                let update_result = this.update(cx, |workspace, cx| {
+                    let next = workspace.terminal_refresh_state();
+                    if workspace.terminal_refresh_state != next {
+                        workspace.terminal_refresh_state = next;
+                        cx.notify();
+                    }
+                });
+
+                if let Err(error) = update_result {
+                    tracing::debug!(%error, "terminal refresh task stopped");
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn terminal_refresh_state(&self) -> Vec<TerminalRefreshEntry> {
+        let Ok(workspace) = self.controller.model.selected_workspace() else {
+            return Vec::new();
+        };
+
+        workspace
+            .panes
+            .iter()
+            .filter_map(|pane| {
+                let surface = pane.surface(pane.selected_surface)?;
+                (surface.kind == SurfaceKind::Terminal).then(|| {
+                    terminal_refresh_entry(surface.id, self.controller.terminals.entry(surface.id))
+                })
+            })
+            .collect()
     }
 
     fn on_new_workspace(
@@ -133,6 +199,62 @@ impl UmuxWorkspace {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TerminalRefreshEntry {
+    surface_id: SurfaceId,
+    registered: bool,
+    failed_message: Option<String>,
+    status: Option<TerminalStatus>,
+    last_error: Option<String>,
+    snapshot_version: Option<u64>,
+}
+
+fn terminal_refresh_entry(
+    surface_id: SurfaceId,
+    entry: Option<&TerminalEntry>,
+) -> TerminalRefreshEntry {
+    match entry {
+        Some(TerminalEntry::Failed { message, .. }) => TerminalRefreshEntry {
+            surface_id,
+            registered: true,
+            failed_message: Some(message.clone()),
+            status: None,
+            last_error: None,
+            snapshot_version: None,
+        },
+        Some(entry) => {
+            terminal_refresh_entry_from_snapshot(surface_id, true, None, entry.snapshot_state())
+        }
+        None => TerminalRefreshEntry {
+            surface_id,
+            registered: false,
+            failed_message: None,
+            status: None,
+            last_error: None,
+            snapshot_version: None,
+        },
+    }
+}
+
+fn terminal_refresh_entry_from_snapshot(
+    surface_id: SurfaceId,
+    registered: bool,
+    failed_message: Option<String>,
+    snapshot: TerminalEntrySnapshot,
+) -> TerminalRefreshEntry {
+    TerminalRefreshEntry {
+        surface_id,
+        registered,
+        failed_message,
+        status: snapshot.health.as_ref().map(|health| health.status.clone()),
+        last_error: snapshot.health.and_then(|health| health.last_error),
+        snapshot_version: snapshot
+            .renderer_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.version),
+    }
+}
+
 impl Render for UmuxWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.selected_workspace_title();
@@ -154,7 +276,7 @@ impl Render for UmuxWorkspace {
                     .child(
                         selected_workspace
                             .as_ref()
-                            .map(pane_group)
+                            .map(|workspace| pane_group(&self.controller, workspace))
                             .unwrap_or_else(|| {
                                 div()
                                     .flex()
@@ -216,8 +338,9 @@ mod tests {
     };
 
     use camino::Utf8PathBuf;
-    use umux_app::{AppAction, AppController, SessionStore};
-    use umux_core::AppModel;
+    use umux_app::{AppAction, AppController, SessionStore, TerminalEntrySnapshot};
+    use umux_core::{AppModel, SurfaceId};
+    use umux_terminal::{TerminalCursor, TerminalHealth, TerminalRendererSnapshot, TerminalStatus};
 
     use crate::startup::StartupState;
 
@@ -250,6 +373,87 @@ mod tests {
         assert!(outcome.should_save_session);
         assert_eq!(selected_workspace.title, "Beta");
         assert_eq!(selected_workspace.cwd, "C:/work/beta");
+    }
+
+    #[test]
+    fn workspace_materializes_initial_deferred_terminal() {
+        let temp_dir = TempSessionDir::new("materialize-initial");
+        let store = SessionStore::new(temp_dir.path.join("session.json"));
+        let startup = StartupState {
+            controller: AppController::new_deferred_terminals(AppModel::new("C:/work/alpha"))
+                .unwrap(),
+            warning: None,
+        };
+        let surface_id = startup
+            .controller
+            .model
+            .selected_pane()
+            .unwrap()
+            .selected_surface;
+
+        let workspace = UmuxWorkspace::new(startup, store);
+
+        assert!(workspace.controller.terminals.contains(surface_id));
+        assert_eq!(workspace.controller.terminals.len(), 1);
+    }
+
+    #[test]
+    fn terminal_refresh_state_tracks_snapshot_status_and_last_error_changes() {
+        let mut health = TerminalHealth::running("pwsh", "C:/work/alpha", 80, 24);
+        health.status = TerminalStatus::Failed;
+        health.last_error = Some("read failed".to_string());
+
+        let entry = super::terminal_refresh_entry_from_snapshot(
+            SurfaceId(10),
+            true,
+            None,
+            TerminalEntrySnapshot {
+                health: Some(health),
+                renderer_snapshot: Some(snapshot(7)),
+            },
+        );
+
+        assert_eq!(entry.surface_id, SurfaceId(10));
+        assert_eq!(entry.status, Some(TerminalStatus::Failed));
+        assert_eq!(entry.last_error, Some("read failed".to_string()));
+        assert_eq!(entry.snapshot_version, Some(7));
+    }
+
+    #[test]
+    fn terminal_refresh_state_tracks_failed_registry_entry_message() {
+        let entry = umux_app::TerminalEntry::Failed {
+            spec: umux_app::TerminalSpawnSpec {
+                workspace_id: umux_core::WorkspaceId(1),
+                pane_id: umux_core::PaneId(2),
+                surface_id: SurfaceId(10),
+                cwd: "C:/work/alpha".to_string(),
+            },
+            message: "pty refused startup".to_string(),
+        };
+
+        let state = super::terminal_refresh_entry(SurfaceId(10), Some(&entry));
+
+        assert!(state.registered);
+        assert_eq!(
+            state.failed_message,
+            Some("pty refused startup".to_string())
+        );
+    }
+
+    fn snapshot(version: u64) -> TerminalRendererSnapshot {
+        TerminalRendererSnapshot {
+            cols: 1,
+            rows: 1,
+            cells: Vec::new(),
+            cursor: TerminalCursor {
+                col: 0,
+                row: 0,
+                visible: false,
+            },
+            selection: None,
+            scrollback_lines: 0,
+            version,
+        }
     }
 
     struct TempSessionDir {

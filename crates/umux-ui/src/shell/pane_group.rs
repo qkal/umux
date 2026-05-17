@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use gpui::{Div, div, prelude::*, px};
+use gpui::{Div, IntoElement, div, prelude::*, px};
+use umux_app::AppController;
 use umux_core::PaneId;
 use umux_core::model::{Pane, SplitAxis, SplitTree, SurfaceKind, Workspace};
 use umux_ui_kit::{BACKGROUND, BORDER, MUTED_TEXT, PANEL, TEXT};
 
 use crate::shell::{surface_tabs, unsupported_surface_message};
+use crate::terminal::terminal_surface;
 use crate::view_model;
 
-pub fn pane_group(workspace: &Workspace) -> Div {
+pub fn pane_group(controller: &AppController, workspace: &Workspace) -> Div {
     div()
         .flex()
         .flex_1()
@@ -16,12 +18,12 @@ pub fn pane_group(workspace: &Workspace) -> Div {
         .min_h(px(0.0))
         .h_full()
         .bg(BACKGROUND)
-        .child(layout_node(&workspace.layout, workspace))
+        .child(layout_node(&workspace.layout, controller, workspace))
 }
 
-fn layout_node(layout: &SplitTree, workspace: &Workspace) -> Div {
+fn layout_node(layout: &SplitTree, controller: &AppController, workspace: &Workspace) -> Div {
     match layout {
-        SplitTree::Leaf(pane_id) => pane_slot(*pane_id, workspace),
+        SplitTree::Leaf(pane_id) => pane_slot(*pane_id, controller, workspace),
         SplitTree::Split {
             axis,
             first,
@@ -33,27 +35,30 @@ fn layout_node(layout: &SplitTree, workspace: &Workspace) -> Div {
             .min_h(px(0.0))
             .when(layout_axis_is_row(*axis), |node| node.flex_row())
             .when(!layout_axis_is_row(*axis), |node| node.flex_col())
-            .child(pane_slot(*first, workspace))
-            .child(pane_slot(*second, workspace)),
+            .child(pane_slot(*first, controller, workspace))
+            .child(pane_slot(*second, controller, workspace)),
     }
 }
 
-fn pane_slot(pane_id: PaneId, workspace: &Workspace) -> Div {
+fn pane_slot(pane_id: PaneId, controller: &AppController, workspace: &Workspace) -> Div {
     workspace
         .pane(pane_id)
-        .map(|pane| pane_view(pane, workspace))
+        .map(|pane| pane_view(pane, controller, workspace))
         .unwrap_or_else(|| missing_pane_view(pane_id))
 }
 
-fn pane_view(pane: &Pane, workspace: &Workspace) -> Div {
+fn pane_view(pane: &Pane, controller: &AppController, workspace: &Workspace) -> Div {
     let view = view_model::pane_view(pane, workspace.selected_pane);
     let selected_surface = pane.surface(pane.selected_surface);
     let body = selected_surface
         .map(|surface| match surface.kind {
-            SurfaceKind::Terminal => "terminal surface".to_string(),
-            kind => unsupported_surface_message(kind, &surface.title),
+            SurfaceKind::Terminal => terminal_surface(controller, surface.id).into_any_element(),
+            kind => unsupported_body(
+                unsupported_surface_message(kind, &surface.title),
+                view.selected,
+            ),
         })
-        .unwrap_or_else(|| "missing selected surface".to_string());
+        .unwrap_or_else(|| unsupported_body("missing selected surface".to_string(), view.selected));
 
     div()
         .flex()
@@ -66,17 +71,7 @@ fn pane_view(pane: &Pane, workspace: &Workspace) -> Div {
         .border_color(BORDER)
         .when(view.selected, |pane| pane.bg(PANEL))
         .child(surface_tabs(view.tabs))
-        .child(
-            div()
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .p(px(16.0))
-                .text_size(px(13.0))
-                .text_color(if view.selected { TEXT } else { MUTED_TEXT })
-                .child(body),
-        )
+        .child(body)
 }
 
 fn missing_pane_view(pane_id: PaneId) -> Div {
@@ -90,6 +85,19 @@ fn missing_pane_view(pane_id: PaneId) -> Div {
         .text_size(px(13.0))
         .text_color(MUTED_TEXT)
         .child(format!("missing pane {}", pane_id.0))
+}
+
+fn unsupported_body(body: String, selected: bool) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .p(px(16.0))
+        .text_size(px(13.0))
+        .text_color(if selected { TEXT } else { MUTED_TEXT })
+        .child(body)
+        .into_any_element()
 }
 
 fn layout_axis_is_row(axis: SplitAxis) -> bool {

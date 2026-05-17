@@ -12,7 +12,7 @@ pub fn run() {
         let store = SessionStore::new(SessionStore::default_path());
         let startup = startup_state_from_store(&store);
         cx.open_window(Default::default(), |_, cx| {
-            cx.new(|_| UmuxWorkspace::new(startup, store))
+            cx.new(|cx| UmuxWorkspace::new_with_context(startup, store, cx))
         })
         .expect("open umux GPUI window");
         cx.activate(true);

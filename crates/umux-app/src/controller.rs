@@ -132,6 +132,21 @@ impl AppController {
         Ok(outcome)
     }
 
+    pub fn materialize_visible_terminal_surfaces(
+        &mut self,
+    ) -> Result<Vec<SurfaceId>, AppControllerError> {
+        let surface_ids = self.visible_terminal_surface_ids()?;
+        let mut materialized = Vec::new();
+        let mut outcome = AppActionOutcome::default();
+
+        for surface_id in surface_ids {
+            self.spawn_surface(surface_id, &mut outcome)?;
+            materialized.extend(outcome.spawned_surfaces.drain(..));
+        }
+
+        Ok(materialized)
+    }
+
     fn spawn_all_terminal_surfaces(&mut self) -> Result<(), AppControllerError> {
         for spec in self.terminal_spawn_specs() {
             self.terminals.spawn(spec)?;
@@ -206,6 +221,19 @@ impl AppController {
         Ok(())
     }
 
+    fn visible_terminal_surface_ids(&self) -> Result<Vec<SurfaceId>, AppControllerError> {
+        let workspace = self.model.selected_workspace()?;
+        Ok(workspace
+            .panes
+            .iter()
+            .filter_map(|pane| {
+                pane.surface(pane.selected_surface)
+                    .filter(|surface| surface.kind == SurfaceKind::Terminal)
+                    .map(|surface| surface.id)
+            })
+            .collect())
+    }
+
     fn remove_closed_surfaces(
         &mut self,
         surface_ids: Vec<SurfaceId>,
@@ -261,6 +289,37 @@ mod tests {
 
         assert!(!controller.terminals.contains(surface_id));
         assert_eq!(controller.terminals.len(), 0);
+    }
+
+    #[test]
+    fn materialize_deferred_controller_spawns_visible_terminal_once() {
+        let mut controller =
+            AppController::new_deferred_terminals(AppModel::new("C:/work/alpha")).unwrap();
+        let surface_id = controller.model.selected_pane().unwrap().selected_surface;
+
+        let spawned = controller.materialize_visible_terminal_surfaces().unwrap();
+        let repeated = controller.materialize_visible_terminal_surfaces().unwrap();
+
+        assert_eq!(spawned, vec![surface_id]);
+        assert_eq!(repeated, Vec::<umux_core::SurfaceId>::new());
+        assert!(controller.terminals.contains(surface_id));
+        assert_eq!(controller.terminals.len(), 1);
+    }
+
+    #[test]
+    fn materialize_deferred_controller_spawns_all_split_visible_terminals() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let first_surface = model.selected_pane().unwrap().selected_surface;
+        model.split_selected_pane(SplitAxis::Vertical).unwrap();
+        let second_surface = model.selected_pane().unwrap().selected_surface;
+        let mut controller = AppController::new_deferred_terminals(model).unwrap();
+
+        let spawned = controller.materialize_visible_terminal_surfaces().unwrap();
+
+        assert_eq!(spawned, vec![first_surface, second_surface]);
+        assert!(controller.terminals.contains(first_surface));
+        assert!(controller.terminals.contains(second_surface));
+        assert_eq!(controller.terminals.len(), 2);
     }
 
     #[test]
