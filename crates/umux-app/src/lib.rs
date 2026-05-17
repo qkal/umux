@@ -9,7 +9,8 @@ pub use action::{AppAction, AppActionOutcome};
 pub use controller::{AppController, AppControllerError};
 pub use session_store::{SessionStore, SessionStoreError};
 pub use terminal_registry::{
-    TerminalEntry, TerminalRegistry, TerminalRegistryError, TerminalSpawnSpec,
+    TerminalEntry, TerminalEntrySnapshot, TerminalRegistry, TerminalRegistryError,
+    TerminalSpawnSpec,
 };
 
 pub const CRATE_NAME: &str = "umux-app";

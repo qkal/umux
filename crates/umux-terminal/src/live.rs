@@ -103,6 +103,11 @@ impl LiveTerminalSession {
             .clone()
     }
 
+    pub fn renderer_state(&self) -> (TerminalHealth, TerminalRendererSnapshot) {
+        let state = self.state.lock().expect("terminal state lock poisoned");
+        (state.health.clone(), state.snapshot.clone())
+    }
+
     pub fn drain_notifications(&self) -> Vec<TerminalNotification> {
         std::mem::take(
             &mut self
@@ -217,6 +222,30 @@ mod tests {
 
         assert_eq!(session.drain_notifications(), vec![notification]);
         assert!(session.drain_notifications().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn renderer_state_clones_health_and_snapshot_under_one_lock() {
+        let mut emulator = crate::TerminalEmulator::new(5, 2, 100);
+        emulator.feed_bytes(b"ready");
+        let state = Arc::new(Mutex::new(LiveState {
+            snapshot: emulator.snapshot(),
+            health: TerminalHealth::running("pwsh", "C:/work/alpha", 5, 2),
+            notifications: Vec::new(),
+        }));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let session = LiveTerminalSession {
+            tx,
+            state,
+            alive: Arc::new(AtomicBool::new(true)),
+            thread: Mutex::new(None),
+        };
+
+        let (health, snapshot) = session.renderer_state();
+
+        assert_eq!(health.shell, "pwsh");
+        assert_eq!(snapshot.visible_text(), "ready\n");
     }
 
     #[cfg(windows)]

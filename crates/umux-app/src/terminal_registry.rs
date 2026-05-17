@@ -33,6 +33,12 @@ pub enum TerminalEntry {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalEntrySnapshot {
+    pub health: Option<TerminalHealth>,
+    pub renderer_snapshot: Option<TerminalRendererSnapshot>,
+}
+
 impl TerminalEntry {
     pub fn surface_id(&self) -> SurfaceId {
         self.spec().surface_id
@@ -45,22 +51,32 @@ impl TerminalEntry {
     }
 
     pub fn snapshot(&self) -> Option<TerminalRendererSnapshot> {
-        match self {
-            #[cfg(windows)]
-            Self::Running { session, .. } => Some(session.snapshot()),
-            #[cfg(not(windows))]
-            Self::Running { .. } => None,
-            Self::Failed { .. } => None,
-        }
+        self.snapshot_state().renderer_snapshot
     }
 
     pub fn health(&self) -> Option<TerminalHealth> {
+        self.snapshot_state().health
+    }
+
+    pub fn snapshot_state(&self) -> TerminalEntrySnapshot {
         match self {
             #[cfg(windows)]
-            Self::Running { session, .. } => Some(session.health()),
+            Self::Running { session, .. } => {
+                let (health, renderer_snapshot) = session.renderer_state();
+                TerminalEntrySnapshot {
+                    health: Some(health),
+                    renderer_snapshot: Some(renderer_snapshot),
+                }
+            }
             #[cfg(not(windows))]
-            Self::Running { .. } => None,
-            Self::Failed { .. } => None,
+            Self::Running { .. } => TerminalEntrySnapshot {
+                health: None,
+                renderer_snapshot: None,
+            },
+            Self::Failed { .. } => TerminalEntrySnapshot {
+                health: None,
+                renderer_snapshot: None,
+            },
         }
     }
 
@@ -221,7 +237,33 @@ mod tests {
         let entry = registry.entry(surface_id).unwrap();
 
         assert_eq!(entry.surface_id(), surface_id);
-        assert_eq!(entry.snapshot(), None);
-        assert_eq!(entry.health(), None);
+        #[cfg(not(windows))]
+        {
+            assert_eq!(entry.snapshot(), None);
+            assert_eq!(entry.health(), None);
+            assert_eq!(
+                entry.snapshot_state(),
+                TerminalEntrySnapshot {
+                    health: None,
+                    renderer_snapshot: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn failed_entry_snapshot_state_is_empty() {
+        let entry = TerminalEntry::Failed {
+            spec: spec(40),
+            message: "pty refused startup".to_string(),
+        };
+
+        assert_eq!(
+            entry.snapshot_state(),
+            TerminalEntrySnapshot {
+                health: None,
+                renderer_snapshot: None,
+            }
+        );
     }
 }
