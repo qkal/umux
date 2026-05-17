@@ -8173,6 +8173,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "umux-ui-kit"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+]
+
+[[package]]
 name = "umux-win32"
 version = "0.1.0"
 dependencies = [
