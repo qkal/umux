@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use gpui::{Context, IntoElement, Render, Window, div, prelude::*, px};
-use umux_app::{AppController, SessionStore};
+use umux_app::{AppAction, AppController, SessionStore};
 use umux_ui_kit::theme::{BACKGROUND, MUTED_TEXT, PANEL, TEXT};
 
+use crate::actions;
 use crate::startup::StartupState;
 
 pub struct UmuxWorkspace {
@@ -44,14 +45,105 @@ impl UmuxWorkspace {
         }
         Ok(outcome)
     }
+
+    fn dispatch_and_notify(&mut self, action: AppAction, cx: &mut Context<Self>) {
+        if let Err(error) = self.dispatch(action) {
+            tracing::warn!(%error, "failed to dispatch workspace action");
+        }
+        cx.notify();
+    }
+
+    fn on_new_workspace(
+        &mut self,
+        _: &actions::NewWorkspace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_and_notify(
+            AppAction::NewWorkspace {
+                cwd: crate::startup::current_dir_cwd(),
+                title: None,
+            },
+            cx,
+        );
+    }
+
+    fn on_new_terminal_tab(
+        &mut self,
+        _: &actions::NewTerminalTab,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_and_notify(AppAction::NewTerminalTab, cx);
+    }
+
+    fn on_close_terminal_tab(
+        &mut self,
+        _: &actions::CloseTerminalTab,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(action) = actions::close_surface_action(&self.controller.model) {
+            self.dispatch_and_notify(action, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn on_close_workspace(
+        &mut self,
+        _: &actions::CloseWorkspace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(action) = actions::close_workspace_action(&self.controller.model) {
+            self.dispatch_and_notify(action, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn on_split_right(
+        &mut self,
+        _: &actions::SplitRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_and_notify(actions::split_right_action(), cx);
+    }
+
+    fn on_split_down(
+        &mut self,
+        _: &actions::SplitDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_and_notify(actions::split_down_action(), cx);
+    }
+
+    fn on_jump_latest_unread(
+        &mut self,
+        _: &actions::JumpLatestUnread,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_and_notify(AppAction::JumpLatestUnread, cx);
+    }
 }
 
 impl Render for UmuxWorkspace {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.selected_workspace_title();
         let warning = self.startup_warning.clone();
 
         div()
+            .on_action(cx.listener(Self::on_new_workspace))
+            .on_action(cx.listener(Self::on_new_terminal_tab))
+            .on_action(cx.listener(Self::on_close_terminal_tab))
+            .on_action(cx.listener(Self::on_close_workspace))
+            .on_action(cx.listener(Self::on_split_right))
+            .on_action(cx.listener(Self::on_split_down))
+            .on_action(cx.listener(Self::on_jump_latest_unread))
             .flex()
             .flex_col()
             .size_full()

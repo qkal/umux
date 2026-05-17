@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod actions;
 pub(crate) mod diagnostics;
 pub mod runtime;
 pub mod startup;
