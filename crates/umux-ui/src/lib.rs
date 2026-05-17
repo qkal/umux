@@ -5,6 +5,7 @@ pub mod shell;
 pub(crate) mod terminal_canvas;
 pub mod terminal_view;
 pub mod theme;
+pub mod view_model;
 
 pub use shell::{run, seed_model};
 

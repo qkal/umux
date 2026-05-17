@@ -24,6 +24,7 @@ use crate::terminal_view::{
     terminal_view_for_entry_with_notifications,
 };
 use crate::theme::{SIDEBAR_WIDTH, SURFACE_TAB_HEIGHT, TOP_BAR_HEIGHT};
+use crate::view_model::{surface_label, workspace_label};
 
 const BACKGROUND: Color = Color::rgb8(0x11, 0x13, 0x16);
 const PANEL: Color = Color::rgb8(0x18, 0x1b, 0x20);
@@ -35,22 +36,6 @@ const RECOVERED_SESSION_WARNING: &str =
 const SESSION_READ_WARNING: &str = "Session file could not be read. Opened a fresh workspace.";
 const RESTORE_CONTROLLER_WARNING: &str =
     "Previous session could not be restored. Opened a fresh workspace.";
-
-fn workspace_row_label(workspace: &umux_core::model::Workspace) -> String {
-    if workspace.unread {
-        format!("{} *", workspace.title)
-    } else {
-        workspace.title.clone()
-    }
-}
-
-fn surface_tab_label(surface: &umux_core::model::Surface) -> String {
-    if surface.unread {
-        format!("{} *", surface.title)
-    } else {
-        surface.title.clone()
-    }
-}
 
 pub fn run() {
     crate::diagnostics::init_diagnostics();
@@ -956,7 +941,7 @@ fn workspace_row_state(model: &AppModel, workspace_id: WorkspaceId) -> Option<Wo
     let window = model.selected_window().ok()?;
     let workspace = window.workspace(workspace_id)?;
     Some(WorkspaceRowState {
-        label: workspace_row_label(workspace),
+        label: workspace_label(workspace),
         selected: window.selected_workspace == workspace_id,
     })
 }
@@ -1068,7 +1053,7 @@ fn surface_tab_state(
         .and_then(|workspace| workspace.pane(pane_id))?;
     let surface = pane.surface(surface_id)?;
     Some(SurfaceTabState {
-        label: surface_tab_label(surface),
+        label: surface_label(surface),
         selected: pane.selected_surface == surface_id,
     })
 }
@@ -1127,23 +1112,36 @@ mod tests {
     use umux_app::session_store::SessionLoadOutcome;
     use umux_app::{AppAction, AppController, SessionStore, SessionStoreError};
     use umux_config::default_shortcuts;
-    use umux_core::model::{Pane, SplitTree, Surface, SurfaceKind, Workspace};
-    use umux_core::{PaneId, SurfaceId, WorkspaceId};
+    use umux_core::{SurfaceId, WorkspaceId};
 
     #[test]
     fn workspace_row_marks_unread_workspace() {
-        let mut workspace = workspace("alpha");
-        workspace.unread = true;
+        let mut model = AppModel::new("C:/work/alpha");
+        let workspace_id = model.selected_workspace().unwrap().id;
+        let surface_id = model.selected_pane().unwrap().selected_surface;
 
-        assert_eq!(workspace_row_label(&workspace), "alpha *");
+        model
+            .mark_surface_unread(surface_id, "done".to_string())
+            .unwrap();
+        let state = workspace_row_state(&model, workspace_id).unwrap();
+
+        assert_eq!(state.label, "alpha *");
+        assert!(state.selected);
     }
 
     #[test]
     fn tab_label_marks_unread_surface() {
-        let mut surface = surface("Terminal");
-        surface.unread = true;
+        let mut model = AppModel::new("C:/work/alpha");
+        let pane_id = model.selected_pane().unwrap().id;
+        let surface_id = model.selected_pane().unwrap().selected_surface;
 
-        assert_eq!(surface_tab_label(&surface), "Terminal *");
+        model
+            .mark_surface_unread(surface_id, "done".to_string())
+            .unwrap();
+        let state = surface_tab_state(&model, pane_id, surface_id).unwrap();
+
+        assert_eq!(state.label, "Terminal *");
+        assert!(state.selected);
     }
 
     #[test]
@@ -1598,35 +1596,6 @@ mod tests {
 
         assert_eq!(before, vec![PaneRow { id: first }, PaneRow { id: second }]);
         assert_eq!(before, after);
-    }
-
-    fn workspace(title: &str) -> Workspace {
-        Workspace {
-            id: WorkspaceId(1),
-            title: title.to_string(),
-            cwd: "C:/work/alpha".to_string(),
-            panes: vec![Pane {
-                id: PaneId(2),
-                cwd: "C:/work/alpha".to_string(),
-                surfaces: vec![surface("Terminal")],
-                selected_surface: SurfaceId(3),
-            }],
-            selected_pane: PaneId(2),
-            layout: SplitTree::Leaf(PaneId(2)),
-            unread: false,
-            latest_notification: None,
-        }
-    }
-
-    fn surface(title: &str) -> Surface {
-        Surface {
-            id: SurfaceId(3),
-            kind: SurfaceKind::Terminal,
-            title: title.to_string(),
-            unread: false,
-            unread_message: None,
-            unread_sequence: None,
-        }
     }
 
     fn temp_session_store(name: &str) -> SessionStore {
