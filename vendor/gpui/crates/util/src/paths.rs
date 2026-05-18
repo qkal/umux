@@ -213,18 +213,14 @@ pub fn strip_path_suffix<'a>(base: &'a Path, suffix: &Path) -> Option<&'a Path> 
         .as_os_str()
         .as_encoded_bytes()
         .strip_suffix(suffix.as_os_str().as_encoded_bytes())
-    {
-        if remainder
+        && remainder
             .last()
             .is_none_or(|last_byte| std::path::is_separator(*last_byte as char))
-        {
-            let os_str = unsafe {
-                OsStr::from_encoded_bytes_unchecked(
-                    &remainder[0..remainder.len().saturating_sub(1)],
-                )
-            };
-            return Some(Path::new(os_str));
-        }
+    {
+        let os_str = unsafe {
+            OsStr::from_encoded_bytes_unchecked(&remainder[0..remainder.len().saturating_sub(1)])
+        };
+        return Some(Path::new(os_str));
     }
     None
 }
@@ -942,7 +938,7 @@ impl PathMatcher {
                 let glob = glob.glob();
                 Some((
                     glob.to_string(),
-                    RelPath::new(&glob.as_ref(), path_style)
+                    RelPath::new(glob.as_ref(), path_style)
                         .ok()
                         .map(std::borrow::Cow::into_owned)?,
                     glob.ends_with(path_style.separators_ch()),
@@ -1220,20 +1216,8 @@ fn case_group_key(name: &str, order: SortOrder) -> u8 {
         None => return 0,
     };
     match order {
-        SortOrder::Upper => {
-            if first.is_lowercase() {
-                1
-            } else {
-                0
-            }
-        }
-        SortOrder::Lower => {
-            if first.is_uppercase() {
-                1
-            } else {
-                0
-            }
-        }
+        SortOrder::Upper if first.is_lowercase() => 1,
+        SortOrder::Lower if first.is_uppercase() => 1,
         _ => 0,
     }
 }
@@ -1292,12 +1276,16 @@ pub fn compare_rel_paths_by(
                     return file_dir_ordering;
                 }
 
-                let (a_stem, a_ext) = a_leaf_file
-                    .then(|| stem_and_extension(component_a))
-                    .unwrap_or_default();
-                let (b_stem, b_ext) = b_leaf_file
-                    .then(|| stem_and_extension(component_b))
-                    .unwrap_or_default();
+                let (a_stem, a_ext) = if a_leaf_file {
+                    stem_and_extension(component_a)
+                } else {
+                    Default::default()
+                };
+                let (b_stem, b_ext) = if b_leaf_file {
+                    stem_and_extension(component_b)
+                } else {
+                    Default::default()
+                };
                 let a_key = if a_leaf_file {
                     a_stem
                 } else {
@@ -1491,19 +1479,34 @@ pub trait UrlExt {
     /// A version of `url::Url::to_file_path` that does platform handling based on the provided `PathStyle` instead of the host platform.
     ///
     /// Prefer using this over `url::Url::to_file_path` when you need to handle paths in a cross-platform way as is the case for remoting interactions.
-    fn to_file_path_ext(&self, path_style: PathStyle) -> Result<PathBuf, ()>;
+    fn to_file_path_ext(&self, path_style: PathStyle) -> Result<PathBuf, UrlToFilePathError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct UrlToFilePathError;
+
+impl Error for UrlToFilePathError {}
+
+impl Display for UrlToFilePathError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("URL cannot be converted to a file path for the requested path style")
+    }
 }
 
 impl UrlExt for url::Url {
     // Copied from `url::Url::to_file_path`, but the `cfg` handling is replaced with runtime branching on `PathStyle`
-    fn to_file_path_ext(&self, source_path_style: PathStyle) -> Result<PathBuf, ()> {
+    fn to_file_path_ext(
+        &self,
+        source_path_style: PathStyle,
+    ) -> Result<PathBuf, UrlToFilePathError> {
         if let Some(segments) = self.path_segments() {
             let host = match self.host() {
                 None | Some(url::Host::Domain("localhost")) => None,
                 Some(_) if source_path_style.is_windows() && self.scheme() == "file" => {
                     self.host_str()
                 }
-                _ => return Err(()),
+                _ => return Err(UrlToFilePathError),
             };
 
             let str_len = self.as_str().len();
@@ -1528,15 +1531,17 @@ impl UrlExt for url::Url {
             estimated_capacity: usize,
             host: Option<&str>,
             segments: std::str::Split<'_, char>,
-        ) -> Result<PathBuf, ()> {
+        ) -> Result<PathBuf, UrlToFilePathError> {
             use percent_encoding::percent_decode;
 
             if host.is_some() {
-                return Err(());
+                return Err(UrlToFilePathError);
             }
 
             let mut bytes = Vec::new();
-            bytes.try_reserve(estimated_capacity).map_err(|_| ())?;
+            bytes
+                .try_reserve(estimated_capacity)
+                .map_err(|_| UrlToFilePathError)?;
 
             for segment in segments {
                 bytes.push(b'/');
@@ -1551,7 +1556,7 @@ impl UrlExt for url::Url {
                 bytes.push(b'/');
             }
 
-            let path = String::from_utf8(bytes).map_err(|_| ())?;
+            let path = String::from_utf8(bytes).map_err(|_| UrlToFilePathError)?;
             debug_assert!(
                 PathStyle::Posix.is_absolute(&path),
                 "to_file_path() failed to produce an absolute Path"
@@ -1564,22 +1569,24 @@ impl UrlExt for url::Url {
             estimated_capacity: usize,
             host: Option<&str>,
             mut segments: std::str::Split<'_, char>,
-        ) -> Result<PathBuf, ()> {
+        ) -> Result<PathBuf, UrlToFilePathError> {
             use percent_encoding::percent_decode_str;
             let mut string = String::new();
-            string.try_reserve(estimated_capacity).map_err(|_| ())?;
+            string
+                .try_reserve(estimated_capacity)
+                .map_err(|_| UrlToFilePathError)?;
             if let Some(host) = host {
                 string.push_str(r"\\");
                 string.push_str(host);
             } else {
-                let first = segments.next().ok_or(())?;
+                let first = segments.next().ok_or(UrlToFilePathError)?;
 
                 match first.len() {
                     2 => {
                         if !first.starts_with(|c| char::is_ascii_alphabetic(&c))
                             || first.as_bytes()[1] != b':'
                         {
-                            return Err(());
+                            return Err(UrlToFilePathError);
                         }
 
                         string.push_str(first);
@@ -1587,21 +1594,21 @@ impl UrlExt for url::Url {
 
                     4 => {
                         if !first.starts_with(|c| char::is_ascii_alphabetic(&c)) {
-                            return Err(());
+                            return Err(UrlToFilePathError);
                         }
                         let bytes = first.as_bytes();
                         if bytes[1] != b'%'
                             || bytes[2] != b'3'
                             || (bytes[3] != b'a' && bytes[3] != b'A')
                         {
-                            return Err(());
+                            return Err(UrlToFilePathError);
                         }
 
                         string.push_str(&first[0..1]);
                         string.push(':');
                     }
 
-                    _ => return Err(()),
+                    _ => return Err(UrlToFilePathError),
                 }
             };
 
@@ -1611,7 +1618,7 @@ impl UrlExt for url::Url {
                 // Currently non-unicode windows paths cannot be represented
                 match percent_decode_str(segment).decode_utf8() {
                     Ok(s) => string.push_str(&s),
-                    Err(..) => return Err(()),
+                    Err(..) => return Err(UrlToFilePathError),
                 }
             }
             // ensure our estimated capacity was good
@@ -1630,7 +1637,7 @@ impl UrlExt for url::Url {
             let path = PathBuf::from(string);
             Ok(path)
         }
-        Err(())
+        Err(UrlToFilePathError)
     }
 }
 
@@ -3413,7 +3420,10 @@ mod tests {
         use super::UrlExt;
 
         let url = url::Url::parse("file://somehost/home/user/file.txt").unwrap();
-        assert_eq!(url.to_file_path_ext(PathStyle::Posix), Err(()));
+        assert_eq!(
+            url.to_file_path_ext(PathStyle::Posix),
+            Err(UrlToFilePathError)
+        );
     }
 
     #[test]
@@ -3524,16 +3534,28 @@ mod tests {
         use super::UrlExt;
 
         let url = url::Url::parse("file:///1:/path/file.txt").unwrap();
-        assert_eq!(url.to_file_path_ext(PathStyle::Windows), Err(()));
+        assert_eq!(
+            url.to_file_path_ext(PathStyle::Windows),
+            Err(UrlToFilePathError)
+        );
 
         let url = url::Url::parse("file:///CC:/path/file.txt").unwrap();
-        assert_eq!(url.to_file_path_ext(PathStyle::Windows), Err(()));
+        assert_eq!(
+            url.to_file_path_ext(PathStyle::Windows),
+            Err(UrlToFilePathError)
+        );
 
         let url = url::Url::parse("file:///C/path/file.txt").unwrap();
-        assert_eq!(url.to_file_path_ext(PathStyle::Windows), Err(()));
+        assert_eq!(
+            url.to_file_path_ext(PathStyle::Windows),
+            Err(UrlToFilePathError)
+        );
 
         let url = url::Url::parse("file:///invalid").unwrap();
-        assert_eq!(url.to_file_path_ext(PathStyle::Windows), Err(()));
+        assert_eq!(
+            url.to_file_path_ext(PathStyle::Windows),
+            Err(UrlToFilePathError)
+        );
     }
 
     #[test]
@@ -3541,12 +3563,24 @@ mod tests {
         use super::UrlExt;
 
         let url = url::Url::parse("http://example.com/path").unwrap();
-        assert_eq!(url.to_file_path_ext(PathStyle::Posix), Err(()));
-        assert_eq!(url.to_file_path_ext(PathStyle::Windows), Err(()));
+        assert_eq!(
+            url.to_file_path_ext(PathStyle::Posix),
+            Err(UrlToFilePathError)
+        );
+        assert_eq!(
+            url.to_file_path_ext(PathStyle::Windows),
+            Err(UrlToFilePathError)
+        );
 
         let url = url::Url::parse("https://example.com/path").unwrap();
-        assert_eq!(url.to_file_path_ext(PathStyle::Posix), Err(()));
-        assert_eq!(url.to_file_path_ext(PathStyle::Windows), Err(()));
+        assert_eq!(
+            url.to_file_path_ext(PathStyle::Posix),
+            Err(UrlToFilePathError)
+        );
+        assert_eq!(
+            url.to_file_path_ext(PathStyle::Windows),
+            Err(UrlToFilePathError)
+        );
     }
 
     #[test]

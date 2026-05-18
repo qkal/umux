@@ -26,6 +26,7 @@ pub enum RenameEdit {
     Cancel,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn surface_tabs(
     pane_id: PaneId,
     tabs: Vec<SurfaceTab>,
