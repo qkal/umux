@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use gpui::{App, Div, MouseButton, div, prelude::*, px};
-use umux_ui_kit::{
-    ACTIVE, BORDER, DIM_TEXT, ELEVATED, HOVER, MUTED_TEXT, PANEL, TEXT,
-};
+use umux_ui_kit::{ACTIVE, BORDER, DIM_TEXT, ELEVATED, HOVER, MUTED_TEXT, PANEL, TEXT};
 
 pub fn top_bar(
     title: String,
@@ -28,13 +26,13 @@ pub fn top_bar(
                 .flex()
                 .items_center()
                 .min_w(px(0.0))
-                .child(div().font_weight(gpui::FontWeight::BOLD).text_color(TEXT).child("umux"))
                 .child(
                     div()
-                        .ml(px(12.0))
-                        .text_color(DIM_TEXT)
-                        .child("workspace:"),
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(TEXT)
+                        .child("umux"),
                 )
+                .child(div().ml(px(12.0)).text_color(DIM_TEXT).child("workspace:"))
                 .child(
                     div()
                         .ml(px(6.0))
@@ -44,17 +42,12 @@ pub fn top_bar(
                         .child(title),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .children([
-                    top_bar_action("+", on_new_terminal_tab).into_any_element(),
-                    top_bar_action("split >", on_split_right).into_any_element(),
-                    top_bar_action("split v", on_split_down).into_any_element(),
-                    top_bar_action("!", on_jump_latest_unread).into_any_element(),
-                ]),
-        )
+        .child(div().flex().items_center().children([
+            top_bar_action("+", on_new_terminal_tab).into_any_element(),
+            top_bar_action("split >", on_split_right).into_any_element(),
+            top_bar_action("split v", on_split_down).into_any_element(),
+            top_bar_action("!", on_jump_latest_unread).into_any_element(),
+        ]))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

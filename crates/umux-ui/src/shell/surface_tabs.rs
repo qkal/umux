@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use gpui::{div, prelude::*, px, App, Div, Keystroke, MouseButton};
+use gpui::{App, Div, Keystroke, MouseButton, div, prelude::*, px};
 use umux_core::{PaneId, SurfaceId};
 use umux_ui_kit::{
     ACTIVE, BORDER, BORDER_STRONG, DIM_TEXT, ELEVATED, HOVER, MUTED_TEXT, PANEL, SURFACE, TEXT,
