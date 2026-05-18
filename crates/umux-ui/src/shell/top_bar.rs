@@ -2,7 +2,7 @@
 
 use gpui::{App, Div, MouseButton, div, prelude::*, px};
 use umux_ui_kit::{
-    BORDER, DIM_TEXT, ELEVATED, HOVER, MUTED_TEXT, PANEL, TEXT,
+    ACTIVE, BORDER, DIM_TEXT, ELEVATED, HOVER, MUTED_TEXT, PANEL, TEXT,
 };
 
 pub fn top_bar(
@@ -62,8 +62,12 @@ pub(crate) fn top_bar_action_labels() -> [&'static str; 4] {
     ["+", "split >", "split v", "!"]
 }
 
-fn top_bar_action(label: &'static str, on_click: impl Fn(&mut App) + Clone + 'static) -> Div {
+fn top_bar_action(
+    label: &'static str,
+    on_click: impl Fn(&mut App) + Clone + 'static,
+) -> impl IntoElement {
     div()
+        .id(("top-bar-action", top_bar_action_id(label)))
         .flex()
         .items_center()
         .justify_center()
@@ -78,8 +82,16 @@ fn top_bar_action(label: &'static str, on_click: impl Fn(&mut App) + Clone + 'st
         .text_size(px(11.0))
         .cursor_pointer()
         .hover(|style| style.bg(HOVER).text_color(TEXT))
+        .active(|style| style.bg(ACTIVE))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| on_click(cx))
         .child(label)
+}
+
+fn top_bar_action_id(label: &str) -> usize {
+    top_bar_action_labels()
+        .iter()
+        .position(|candidate| *candidate == label)
+        .expect("top-bar action label should have a stable id")
 }
 
 #[cfg(test)]
