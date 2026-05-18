@@ -236,7 +236,9 @@ mod tests {
 
         assert_eq!(decoded.id, 10);
         assert_eq!(decoded.result(), None);
-        let error = decoded.error_frame().expect("error frame should be present");
+        let error = decoded
+            .error_frame()
+            .expect("error frame should be present");
         assert_eq!(error.code, "invalid_params");
         assert_eq!(error.message, "axis is required");
     }
