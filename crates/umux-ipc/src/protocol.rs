@@ -228,6 +228,22 @@ mod tests {
     }
 
     #[test]
+    fn error_response_round_trips_with_structured_error() {
+        let frame = ResponseFrame::error(10, "invalid_params", "axis is required");
+
+        let line = frame.to_json_line().expect("response should encode");
+        let decoded = ResponseFrame::from_json_line(&line).expect("response should decode");
+
+        assert_eq!(decoded.id, 10);
+        assert_eq!(decoded.result(), None);
+        let error = decoded
+            .error_frame()
+            .expect("error frame should be present");
+        assert_eq!(error.code, "invalid_params");
+        assert_eq!(error.message, "axis is required");
+    }
+
+    #[test]
     fn null_result_response_round_trips_as_result_present() {
         let frame = ResponseFrame::ok(5, Value::Null);
 

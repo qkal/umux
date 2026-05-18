@@ -1045,6 +1045,81 @@ mod tests {
     }
 
     #[test]
+    fn restore_uses_surface_metadata_when_unread_target_envelope_is_stale() {
+        let json = r#"{
+  "schema_version": 2,
+  "selected_window": 1,
+  "latest_unread_target": {
+    "workspace_id": 2,
+    "pane_id": 3,
+    "surface_id": 4,
+    "message": "Stale envelope",
+    "sequence": 1
+  },
+  "next_unread_sequence": 2,
+  "windows": [
+    {
+      "id": 1,
+      "selected_workspace": 2,
+      "workspaces": [
+        {
+          "id": 2,
+          "title": "alpha",
+          "cwd": "C:/work/alpha",
+          "selected_pane": 3,
+          "layout": { "type": "leaf", "pane": 3 },
+          "unread": true,
+          "latest_notification": "Stale envelope",
+          "panes": [
+            {
+              "id": 3,
+              "cwd": "C:/work/alpha",
+              "selected_surface": 4,
+              "surfaces": [
+                {
+                  "id": 4,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": false,
+                  "unread_message": null,
+                  "unread_sequence": null
+                },
+                {
+                  "id": 5,
+                  "kind": "terminal",
+                  "title": "Terminal",
+                  "unread": true,
+                  "unread_message": "Fresh surface",
+                  "unread_sequence": 7
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}"#;
+
+        let restored = AppSnapshot::from_json_str(json)
+            .unwrap()
+            .into_model()
+            .unwrap();
+
+        let target = restored.latest_unread_target.as_ref().unwrap();
+        assert_eq!(target.surface_id, SurfaceId(5));
+        assert_eq!(target.message, "Fresh surface");
+        assert_eq!(target.sequence, 7);
+        assert_eq!(restored.next_unread_sequence, 8);
+        let workspace = restored.selected_workspace().unwrap();
+        assert!(workspace.unread);
+        assert_eq!(
+            workspace.latest_notification,
+            Some("Fresh surface".to_string())
+        );
+    }
+
+    #[test]
     fn restore_replaces_selected_browser_surface_with_terminal_surface() {
         let mut app = AppModel::new("C:/work/alpha");
         let browser = app

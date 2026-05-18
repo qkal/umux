@@ -85,6 +85,28 @@ mod tests {
     }
 
     #[test]
+    fn builds_ping_request() {
+        let cli = Cli::parse_from(["umux-cli", "--dry-run-json", "ping"]);
+
+        let request = cli.into_request(11).expect("request should build");
+
+        assert_eq!(request.id, 11);
+        assert_eq!(request.method, Method::SystemPing);
+        assert_eq!(request.params, serde_json::json!({}));
+    }
+
+    #[test]
+    fn builds_split_request_with_axis_param() {
+        let cli = Cli::parse_from(["umux-cli", "--dry-run-json", "split", "vertical"]);
+
+        let request = cli.into_request(12).expect("request should build");
+
+        assert_eq!(request.id, 12);
+        assert_eq!(request.method, Method::PaneSplit);
+        assert_eq!(request.params["axis"], "vertical");
+    }
+
+    #[test]
     fn builds_browser_open_request() {
         let cli = Cli::parse_from([
             "umux-cli",

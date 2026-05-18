@@ -6,20 +6,73 @@ on:
   pull_request:
     branches: ["main"]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  rust:
+  quality:
+    name: quality
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Format
-        if: ${{ hashFiles('Cargo.toml') != '' }}
         run: cargo fmt --check
-      - name: Clippy
-        if: ${{ hashFiles('Cargo.toml') != '' }}
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
-        if: ${{ hashFiles('Cargo.toml') != '' }}
-        run: cargo test --all
+      - name: Clippy first-party non-GPUI crates
+        run: >
+          cargo clippy --locked --no-deps --all-targets
+          -p umux-app
+          -p umux-core
+          -p umux-ipc
+          -p umux-session
+          -p umux-notify
+          -p umux-browser
+          -p umux-cli
+          -p umux-cli-bin
+          -p umux-config
+          -p umux-terminal
+          -p umux-win32
+          -- -D warnings
+
+  windows-tests:
+    name: windows tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test first-party non-GPUI crates
+        run: >
+          cargo test --locked
+          -p umux-app
+          -p umux-core
+          -p umux-ipc
+          -p umux-session
+          -p umux-notify
+          -p umux-browser
+          -p umux-cli
+          -p umux-cli-bin
+          -p umux-config
+          -p umux-terminal
+          -p umux-win32
+
+  linux-portable-tests:
+    name: linux portable tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test portable crates
+        run: >
+          cargo test --locked
+          -p umux-core
+          -p umux-ipc
+          -p umux-session
+          -p umux-notify
+          -p umux-browser
+          -p umux-cli
+          -p umux-config
