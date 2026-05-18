@@ -473,6 +473,30 @@ impl Render for UmuxWorkspace {
                 );
             }
         };
+        let on_new_terminal_tab = {
+            let workspace_handle = workspace_handle.clone();
+            move |cx: &mut App| {
+                Self::dispatch_from_weak(&workspace_handle, AppAction::NewTerminalTab, cx);
+            }
+        };
+        let on_split_right = {
+            let workspace_handle = workspace_handle.clone();
+            move |cx: &mut App| {
+                Self::dispatch_from_weak(&workspace_handle, actions::split_right_action(), cx);
+            }
+        };
+        let on_split_down = {
+            let workspace_handle = workspace_handle.clone();
+            move |cx: &mut App| {
+                Self::dispatch_from_weak(&workspace_handle, actions::split_down_action(), cx);
+            }
+        };
+        let on_jump_latest_unread = {
+            let workspace_handle = workspace_handle.clone();
+            move |cx: &mut App| {
+                Self::dispatch_from_weak(&workspace_handle, AppAction::JumpLatestUnread, cx);
+            }
+        };
         let body = self
             .controller
             .model
@@ -542,7 +566,13 @@ impl Render for UmuxWorkspace {
             .size_full()
             .bg(BACKGROUND)
             .text_color(TEXT)
-            .child(top_bar(title))
+            .child(top_bar(
+                title,
+                on_new_terminal_tab,
+                on_split_right,
+                on_split_down,
+                on_jump_latest_unread,
+            ))
             .when_some(warning, |shell, warning| {
                 shell.child(
                     div()
