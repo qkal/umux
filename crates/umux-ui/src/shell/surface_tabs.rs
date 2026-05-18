@@ -67,7 +67,7 @@ pub fn surface_tabs(
                     )
                 })),
         )
-        .child(new_tab_control(on_new))
+        .child(new_tab_control(pane_id, on_new))
 }
 
 fn surface_tab(
@@ -251,9 +251,12 @@ fn rename_editor(
         .child(div().ml(px(2.0)).w(px(1.0)).h(px(14.0)).bg(TEXT))
 }
 
-fn new_tab_control(on_new: impl Fn(&mut App) + Clone + 'static) -> impl IntoElement {
+fn new_tab_control(
+    pane_id: PaneId,
+    on_new: impl Fn(&mut App) + Clone + 'static,
+) -> impl IntoElement {
     div()
-        .id("surface-new-tab")
+        .id(("surface-new-tab", pane_id.0))
         .flex()
         .items_center()
         .justify_center()
