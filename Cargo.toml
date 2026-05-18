@@ -71,8 +71,6 @@ derive_refineable = { path = "vendor/gpui/crates/derive_refineable" }
 dirs = "6.0"
 dunce = "1.0"
 env_logger = "0.11"
-floem = "0.2.0"
-floem_renderer = "0.2.0"
 futures = "0.3.32"
 futures-concurrency = "7.7.1"
 futures-lite = "1.13"
