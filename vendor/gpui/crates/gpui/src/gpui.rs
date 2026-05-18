@@ -3,33 +3,6 @@
 #![allow(clippy::type_complexity)] // Not useful, GPUI makes heavy use of callbacks
 #![allow(clippy::collapsible_else_if)] // False positives in platform specific code
 #![allow(unused_mut)] // False positives in platform specific code
-#![allow(
-    clippy::collapsible_if,
-    clippy::collapsible_match,
-    clippy::excessive_precision,
-    clippy::doc_lazy_continuation,
-    clippy::from_over_into,
-    clippy::if_same_then_else,
-    clippy::legacy_numeric_constants,
-    clippy::len_without_is_empty,
-    clippy::len_zero,
-    clippy::let_and_return,
-    clippy::let_unit_value,
-    clippy::manual_async_fn,
-    clippy::manual_map,
-    clippy::match_like_matches_macro,
-    clippy::mem_replace_with_default,
-    clippy::needless_borrow,
-    clippy::needless_borrows_for_generic_args,
-    clippy::new_ret_no_self,
-    clippy::new_without_default,
-    clippy::question_mark,
-    clippy::redundant_closure,
-    clippy::redundant_static_lifetimes,
-    clippy::single_match,
-    clippy::too_many_arguments,
-    clippy::unnecessary_map_or
-)]
 
 extern crate self as gpui;
 #[doc(hidden)]

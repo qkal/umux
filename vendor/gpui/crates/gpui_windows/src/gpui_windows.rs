@@ -1,21 +1,4 @@
 #![cfg(target_os = "windows")]
-#![allow(
-    clippy::collapsible_if,
-    clippy::field_reassign_with_default,
-    clippy::let_unit_value,
-    clippy::needless_borrow,
-    clippy::needless_borrows_for_generic_args,
-    clippy::needless_else,
-    clippy::needless_return,
-    clippy::nonminimal_bool,
-    clippy::partialeq_to_none,
-    clippy::ptr_arg,
-    clippy::redundant_pattern_matching,
-    clippy::too_many_arguments,
-    clippy::type_complexity,
-    clippy::unnecessary_mut_passed,
-    clippy::upper_case_acronyms
-)]
 
 mod clipboard;
 mod destination_list;
