@@ -13,8 +13,10 @@ pub(crate) const NEW_TAB_LABEL: &str = "+";
 pub(crate) const CLOSE_TAB_LABEL: &str = "x";
 pub(crate) const RENAME_TAB_LABEL: &str = "edit";
 pub(crate) const TAB_HEIGHT: f32 = 34.0;
+pub(crate) const TAB_WIDTH: f32 = 252.0;
 pub(crate) const TAB_CONTROL_SIZE: f32 = 18.0;
 pub(crate) const TAB_RENAME_SLOT_WIDTH: f32 = 36.0;
+pub(crate) const TAB_CLOSE_SLOT_WIDTH: f32 = 18.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenameEdit {
@@ -77,7 +79,9 @@ fn surface_tab(
         .flex()
         .items_center()
         .h_full()
-        .min_w(px(120.0))
+        .flex_none()
+        .w(px(TAB_WIDTH))
+        .min_w(px(TAB_WIDTH))
         .px(px(10.0))
         .border_r_1()
         .border_color(BORDER)
@@ -88,32 +92,24 @@ fn surface_tab(
         .hover(|style| style.bg(HOVER).text_color(TEXT))
         .active(|style| style.bg(ACTIVE))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| on_select(id, cx))
-        .child(if is_renaming {
+        .child(div().flex_1().min_w(px(0.0)).child(if is_renaming {
             rename_editor(id, rename_buffer, on_rename_edit).into_any_element()
         } else {
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .child(label)
-                .into_any_element()
-        })
+            div().truncate().child(label).into_any_element()
+        }))
         .child(unread_marker(unread))
-        .when(!is_renaming, |tab| {
-            tab.child(rename_tab_slot(
-                id,
-                title,
-                selected,
-                on_start_rename.clone(),
-            ))
-        })
-        .when(!is_renaming, |tab| {
-            tab.child(close_tab_control(id, on_close))
-        })
+        .child(rename_tab_slot(
+            id,
+            title,
+            selected && !is_renaming,
+            on_start_rename,
+        ))
+        .child(close_tab_slot(id, !is_renaming, on_close))
 }
 
 fn unread_marker(unread: bool) -> Div {
     div()
+        .flex_none()
         .ml(px(6.0))
         .w(px(6.0))
         .h(px(6.0))
@@ -127,11 +123,27 @@ fn rename_tab_slot(
     on_start_rename: impl Fn(SurfaceId, String, &mut App) + Clone + 'static,
 ) -> Div {
     div()
+        .flex_none()
         .ml(px(8.0))
         .w(px(TAB_RENAME_SLOT_WIDTH))
         .h(px(TAB_CONTROL_SIZE))
         .when(selected, |slot| {
             slot.child(rename_tab_control(surface_id, title, on_start_rename))
+        })
+}
+
+fn close_tab_slot(
+    surface_id: SurfaceId,
+    closable: bool,
+    on_close: impl Fn(SurfaceId, &mut App) + Clone + 'static,
+) -> Div {
+    div()
+        .flex_none()
+        .ml(px(8.0))
+        .w(px(TAB_CLOSE_SLOT_WIDTH))
+        .h(px(TAB_CONTROL_SIZE))
+        .when(closable, |slot| {
+            slot.child(close_tab_control(surface_id, on_close))
         })
 }
 
@@ -144,7 +156,7 @@ fn close_tab_control(
         .flex()
         .items_center()
         .justify_center()
-        .ml(px(8.0))
+        .flex_none()
         .w(px(TAB_CONTROL_SIZE))
         .h(px(TAB_CONTROL_SIZE))
         .text_size(px(12.0))
@@ -198,7 +210,7 @@ fn rename_editor(
         .key_context("SurfaceRename")
         .flex()
         .items_center()
-        .w(px(150.0))
+        .w_full()
         .h(px(22.0))
         .px(px(6.0))
         .border_1()
@@ -233,6 +245,7 @@ fn new_tab_control(on_new: impl Fn(&mut App) + Clone + 'static) -> impl IntoElem
         .flex()
         .items_center()
         .justify_center()
+        .flex_none()
         .h_full()
         .min_w(px(34.0))
         .px(px(8.0))
@@ -330,7 +343,9 @@ mod tests {
     #[test]
     fn tabs_keep_stable_control_dimensions() {
         assert_eq!(super::TAB_HEIGHT, 34.0);
+        assert_eq!(super::TAB_WIDTH, 252.0);
         assert_eq!(super::TAB_CONTROL_SIZE, 18.0);
         assert_eq!(super::TAB_RENAME_SLOT_WIDTH, 36.0);
+        assert_eq!(super::TAB_CLOSE_SLOT_WIDTH, 18.0);
     }
 }
