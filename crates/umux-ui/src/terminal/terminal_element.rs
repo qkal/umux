@@ -21,6 +21,7 @@ const STATUS_PADDING: f32 = 12.0;
 pub struct UmuxTerminalElement {
     status: SharedString,
     frame: Option<TerminalDrawFrame>,
+    on_bounds: Option<Box<dyn Fn(Bounds<Pixels>)>>,
 }
 
 pub fn terminal_element(
@@ -31,6 +32,14 @@ pub fn terminal_element(
         status: status.into(),
         frame: snapshot
             .map(|snapshot| prepare_terminal_draw_frame(snapshot, TerminalMetrics::new(8.0, 16.0))),
+        on_bounds: None,
+    }
+}
+
+impl UmuxTerminalElement {
+    pub fn on_bounds(mut self, callback: impl Fn(Bounds<Pixels>) + 'static) -> Self {
+        self.on_bounds = Some(Box::new(callback));
+        self
     }
 }
 
@@ -93,6 +102,10 @@ impl Element for UmuxTerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let Some(on_bounds) = &self.on_bounds {
+            on_bounds(bounds);
+        }
+
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let Some(frame) = prepaint.take() else {
                 paint_status_lines(bounds, self.status.clone(), window, cx);

@@ -7,10 +7,14 @@ use umux_core::model::{Pane, SplitAxis, SplitTree, SurfaceKind, Workspace};
 use umux_ui_kit::{BACKGROUND, BORDER, MUTED_TEXT, PANEL, TEXT};
 
 use crate::shell::{surface_tabs, unsupported_surface_message};
-use crate::terminal::terminal_surface;
+use crate::terminal::{TerminalSurfaceState, terminal_surface};
 use crate::view_model;
 
-pub fn pane_group(controller: &AppController, workspace: &Workspace) -> Div {
+pub fn pane_group(
+    controller: &AppController,
+    workspace: &Workspace,
+    terminal_surface_state: &TerminalSurfaceState,
+) -> Div {
     div()
         .flex()
         .flex_1()
@@ -18,12 +22,24 @@ pub fn pane_group(controller: &AppController, workspace: &Workspace) -> Div {
         .min_h(px(0.0))
         .h_full()
         .bg(BACKGROUND)
-        .child(layout_node(&workspace.layout, controller, workspace))
+        .child(layout_node(
+            &workspace.layout,
+            controller,
+            workspace,
+            terminal_surface_state,
+        ))
 }
 
-fn layout_node(layout: &SplitTree, controller: &AppController, workspace: &Workspace) -> Div {
+fn layout_node(
+    layout: &SplitTree,
+    controller: &AppController,
+    workspace: &Workspace,
+    terminal_surface_state: &TerminalSurfaceState,
+) -> Div {
     match layout {
-        SplitTree::Leaf(pane_id) => pane_slot(*pane_id, controller, workspace),
+        SplitTree::Leaf(pane_id) => {
+            pane_slot(*pane_id, controller, workspace, terminal_surface_state)
+        }
         SplitTree::Split {
             axis,
             first,
@@ -35,24 +51,46 @@ fn layout_node(layout: &SplitTree, controller: &AppController, workspace: &Works
             .min_h(px(0.0))
             .when(layout_axis_is_row(*axis), |node| node.flex_row())
             .when(!layout_axis_is_row(*axis), |node| node.flex_col())
-            .child(pane_slot(*first, controller, workspace))
-            .child(pane_slot(*second, controller, workspace)),
+            .child(pane_slot(
+                *first,
+                controller,
+                workspace,
+                terminal_surface_state,
+            ))
+            .child(pane_slot(
+                *second,
+                controller,
+                workspace,
+                terminal_surface_state,
+            )),
     }
 }
 
-fn pane_slot(pane_id: PaneId, controller: &AppController, workspace: &Workspace) -> Div {
+fn pane_slot(
+    pane_id: PaneId,
+    controller: &AppController,
+    workspace: &Workspace,
+    terminal_surface_state: &TerminalSurfaceState,
+) -> Div {
     workspace
         .pane(pane_id)
-        .map(|pane| pane_view(pane, controller, workspace))
+        .map(|pane| pane_view(pane, controller, workspace, terminal_surface_state))
         .unwrap_or_else(|| missing_pane_view(pane_id))
 }
 
-fn pane_view(pane: &Pane, controller: &AppController, workspace: &Workspace) -> Div {
+fn pane_view(
+    pane: &Pane,
+    controller: &AppController,
+    workspace: &Workspace,
+    terminal_surface_state: &TerminalSurfaceState,
+) -> Div {
     let view = view_model::pane_view(pane, workspace.selected_pane);
     let selected_surface = pane.surface(pane.selected_surface);
     let body = selected_surface
         .map(|surface| match surface.kind {
-            SurfaceKind::Terminal => terminal_surface(controller, surface.id).into_any_element(),
+            SurfaceKind::Terminal => {
+                terminal_surface(controller, surface.id, terminal_surface_state).into_any_element()
+            }
             kind => unsupported_body(
                 unsupported_surface_message(kind, &surface.title),
                 view.selected,

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 #[cfg(windows)]
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use thiserror::Error;
 use umux_core::{PaneId, SurfaceId, WorkspaceId};
@@ -31,6 +31,15 @@ pub enum TerminalEntry {
         spec: TerminalSpawnSpec,
         message: String,
     },
+}
+
+#[derive(Clone)]
+pub enum TerminalEntryHandle {
+    #[cfg(windows)]
+    Running {
+        session: Weak<umux_terminal::LiveTerminalSession>,
+    },
+    Inert,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +86,18 @@ impl TerminalEntry {
                 health: None,
                 renderer_snapshot: None,
             },
+        }
+    }
+
+    pub fn weak_handle(&self) -> TerminalEntryHandle {
+        match self {
+            #[cfg(windows)]
+            Self::Running { session, .. } => TerminalEntryHandle::Running {
+                session: Arc::downgrade(session),
+            },
+            #[cfg(not(windows))]
+            Self::Running { .. } => TerminalEntryHandle::Inert,
+            Self::Failed { .. } => TerminalEntryHandle::Inert,
         }
     }
 
@@ -265,5 +286,33 @@ mod tests {
                 renderer_snapshot: None,
             }
         );
+    }
+}
+
+impl TerminalEntryHandle {
+    pub fn send_input(&self, input: impl AsRef<[u8]>) {
+        #[cfg(windows)]
+        {
+            if let Self::Running { session } = self
+                && let Some(session) = session.upgrade()
+            {
+                let _ = session.send_input(input);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = input;
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        #[cfg(windows)]
+        {
+            if let Self::Running { session } = self
+                && let Some(session) = session.upgrade()
+            {
+                let _ = session.resize(cols, rows);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (cols, rows);
     }
 }

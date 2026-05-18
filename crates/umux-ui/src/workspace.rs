@@ -11,12 +11,14 @@ use umux_ui_kit::theme::{BACKGROUND, MUTED_TEXT, PANEL, TEXT};
 use crate::actions;
 use crate::shell::{pane_group, top_bar, workspace_rail};
 use crate::startup::StartupState;
+use crate::terminal::TerminalSurfaceState;
 use crate::view_model::workspace_rows;
 
 pub struct UmuxWorkspace {
     pub controller: AppController,
     pub store: Arc<SessionStore>,
     pub startup_warning: Option<String>,
+    terminal_surface_state: TerminalSurfaceState,
     terminal_refresh_state: Vec<TerminalRefreshEntry>,
     _terminal_refresh_task: Option<Task<()>>,
 }
@@ -27,6 +29,7 @@ impl UmuxWorkspace {
             controller: startup.controller,
             store: Arc::new(store),
             startup_warning: startup.warning,
+            terminal_surface_state: TerminalSurfaceState::new(),
             terminal_refresh_state: Vec::new(),
             _terminal_refresh_task: None,
         };
@@ -89,8 +92,9 @@ impl UmuxWorkspace {
                     .await;
 
                 let update_result = this.update(cx, |workspace, cx| {
+                    let notifications_changed = workspace.drain_terminal_notifications();
                     let next = workspace.terminal_refresh_state();
-                    if workspace.terminal_refresh_state != next {
+                    if workspace.terminal_refresh_state != next || notifications_changed {
                         workspace.terminal_refresh_state = next;
                         cx.notify();
                     }
@@ -119,6 +123,29 @@ impl UmuxWorkspace {
                 })
             })
             .collect()
+    }
+
+    fn drain_terminal_notifications(&mut self) -> bool {
+        let surface_ids = self.controller.terminals.running_surface_ids();
+        let mut changed = false;
+
+        for surface_id in surface_ids {
+            if let Some(entry) = self.controller.terminals.entry(surface_id) {
+                for notification in entry.drain_notifications() {
+                    changed |= self
+                        .controller
+                        .model
+                        .mark_surface_unread(surface_id, notification.message)
+                        .is_ok();
+                }
+            }
+        }
+
+        if changed && let Err(error) = self.store.save_model(&self.controller.model) {
+            tracing::warn!(%error, "failed to save session after terminal notification");
+        }
+
+        changed
     }
 
     fn on_new_workspace(
@@ -276,7 +303,13 @@ impl Render for UmuxWorkspace {
                     .child(
                         selected_workspace
                             .as_ref()
-                            .map(|workspace| pane_group(&self.controller, workspace))
+                            .map(|workspace| {
+                                pane_group(
+                                    &self.controller,
+                                    workspace,
+                                    &self.terminal_surface_state,
+                                )
+                            })
                             .unwrap_or_else(|| {
                                 div()
                                     .flex()
