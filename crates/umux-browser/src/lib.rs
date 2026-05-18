@@ -74,4 +74,36 @@ mod tests {
         assert!(state.can_go_back);
         assert!(!state.can_go_forward);
     }
+
+    #[test]
+    fn browser_open_url_from_middle_replaces_all_forward_history() {
+        let mut state = BrowserSurfaceState::new();
+        state.apply(BrowserCommand::OpenUrl(
+            "https://example.com/one".to_string(),
+        ));
+        state.apply(BrowserCommand::OpenUrl(
+            "https://example.com/two".to_string(),
+        ));
+        state.apply(BrowserCommand::OpenUrl(
+            "https://example.com/three".to_string(),
+        ));
+        state.apply(BrowserCommand::Back);
+        state.apply(BrowserCommand::Back);
+
+        state.apply(BrowserCommand::OpenUrl(
+            "https://example.com/four".to_string(),
+        ));
+        state.apply(BrowserCommand::Forward);
+
+        assert_eq!(
+            state.history,
+            vec!["https://example.com/one", "https://example.com/four"]
+        );
+        assert_eq!(
+            state.current_url.as_deref(),
+            Some("https://example.com/four")
+        );
+        assert!(state.can_go_back);
+        assert!(!state.can_go_forward);
+    }
 }
