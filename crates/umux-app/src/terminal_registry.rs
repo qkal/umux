@@ -223,6 +223,34 @@ fn spawn_terminal_entry(spec: TerminalSpawnSpec) -> TerminalEntry {
     TerminalEntry::Running { spec }
 }
 
+impl TerminalEntryHandle {
+    pub fn send_input(&self, input: impl AsRef<[u8]>) {
+        #[cfg(windows)]
+        {
+            if let Self::Running { session } = self
+                && let Some(session) = session.upgrade()
+            {
+                let _ = session.send_input(input);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = input;
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        #[cfg(windows)]
+        {
+            if let Self::Running { session } = self
+                && let Some(session) = session.upgrade()
+            {
+                let _ = session.resize(cols, rows);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (cols, rows);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,33 +314,5 @@ mod tests {
                 renderer_snapshot: None,
             }
         );
-    }
-}
-
-impl TerminalEntryHandle {
-    pub fn send_input(&self, input: impl AsRef<[u8]>) {
-        #[cfg(windows)]
-        {
-            if let Self::Running { session } = self
-                && let Some(session) = session.upgrade()
-            {
-                let _ = session.send_input(input);
-            }
-        }
-        #[cfg(not(windows))]
-        let _ = input;
-    }
-
-    pub fn resize(&self, cols: u16, rows: u16) {
-        #[cfg(windows)]
-        {
-            if let Self::Running { session } = self
-                && let Some(session) = session.upgrade()
-            {
-                let _ = session.resize(cols, rows);
-            }
-        }
-        #[cfg(not(windows))]
-        let _ = (cols, rows);
     }
 }
