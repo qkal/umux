@@ -4,7 +4,7 @@ use gpui::{App, Div, IntoElement, div, prelude::*, px};
 use umux_app::AppController;
 use umux_core::model::{Pane, SplitAxis, SplitTree, SurfaceKind, Workspace};
 use umux_core::{PaneId, SurfaceId};
-use umux_ui_kit::{BACKGROUND, BORDER, MUTED_TEXT, PANEL, TEXT};
+use umux_ui_kit::{BACKGROUND, BORDER, BORDER_STRONG, MUTED_TEXT, PANEL, SURFACE, TEXT};
 
 use crate::shell::{RenameEdit, surface_tabs, unsupported_surface_message};
 use crate::terminal::{TerminalSurfaceState, terminal_surface};
@@ -199,9 +199,9 @@ where
         .min_w(px(0.0))
         .min_h(px(0.0))
         .h_full()
-        .border_l_1()
-        .border_color(BORDER)
-        .when(view.selected, |pane| pane.bg(PANEL))
+        .border_1()
+        .border_color(if view.selected { BORDER_STRONG } else { BORDER })
+        .bg(if view.selected { PANEL } else { SURFACE })
         .child({
             let pane_id = pane.id;
             let on_select_surface = (*on_select_surface).clone();
@@ -210,6 +210,7 @@ where
             let on_start_rename = (*on_start_rename).clone();
             let on_rename_edit = (*on_rename_edit).clone();
             surface_tabs(
+                pane_id,
                 view.tabs,
                 renaming_surface,
                 rename_buffer,

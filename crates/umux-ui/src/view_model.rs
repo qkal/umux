@@ -29,19 +29,11 @@ pub struct PaneView {
 }
 
 pub fn workspace_label(workspace: &Workspace) -> String {
-    if workspace.unread {
-        format!("{} *", workspace.title)
-    } else {
-        workspace.title.clone()
-    }
+    workspace.title.clone()
 }
 
 pub fn surface_label(surface: &Surface) -> String {
-    if surface.unread {
-        format!("{} *", surface.title)
-    } else {
-        surface.title.clone()
-    }
+    surface.title.clone()
 }
 
 pub fn workspace_rows(workspaces: &[Workspace], selected: WorkspaceId) -> Vec<WorkspaceRow> {
@@ -82,7 +74,7 @@ mod tests {
     use umux_core::model::SurfaceKind;
 
     #[test]
-    fn workspace_row_marks_unread() {
+    fn workspace_row_marks_unread_without_mutating_label() {
         let mut model = AppModel::new("C:/work/alpha");
         let surface_id = model.selected_pane().unwrap().selected_surface;
         model
@@ -92,9 +84,24 @@ mod tests {
 
         let rows = workspace_rows(&window.workspaces, window.selected_workspace);
 
-        assert_eq!(rows[0].label, "alpha *");
+        assert_eq!(rows[0].label, "alpha");
         assert!(rows[0].selected);
         assert!(rows[0].unread);
+    }
+
+    #[test]
+    fn pane_view_marks_unread_without_mutating_surface_label() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let surface_id = model.selected_pane().unwrap().selected_surface;
+        model
+            .mark_surface_unread(surface_id, "done".to_string())
+            .unwrap();
+        let pane = model.selected_pane().unwrap();
+
+        let view = pane_view(pane, pane.id);
+
+        assert_eq!(view.tabs[0].label, "Terminal");
+        assert!(view.tabs[0].unread);
     }
 
     #[test]

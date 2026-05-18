@@ -9,7 +9,7 @@ use umux_app::{
 };
 use umux_core::{PaneId, SurfaceId, SurfaceKind, WorkspaceId};
 use umux_terminal::TerminalStatus;
-use umux_ui_kit::theme::{BACKGROUND, MUTED_TEXT, PANEL, TEXT};
+use umux_ui_kit::theme::{BACKGROUND, BORDER, MUTED_TEXT, TEXT, WARNING, WARNING_TEXT};
 
 use crate::actions;
 use crate::shell::{RenameEdit, pane_group, top_bar, workspace_rail};
@@ -473,6 +473,30 @@ impl Render for UmuxWorkspace {
                 );
             }
         };
+        let on_new_terminal_tab = {
+            let workspace_handle = workspace_handle.clone();
+            move |cx: &mut App| {
+                Self::dispatch_from_weak(&workspace_handle, AppAction::NewTerminalTab, cx);
+            }
+        };
+        let on_split_right = {
+            let workspace_handle = workspace_handle.clone();
+            move |cx: &mut App| {
+                Self::dispatch_from_weak(&workspace_handle, actions::split_right_action(), cx);
+            }
+        };
+        let on_split_down = {
+            let workspace_handle = workspace_handle.clone();
+            move |cx: &mut App| {
+                Self::dispatch_from_weak(&workspace_handle, actions::split_down_action(), cx);
+            }
+        };
+        let on_jump_latest_unread = {
+            let workspace_handle = workspace_handle.clone();
+            move |cx: &mut App| {
+                Self::dispatch_from_weak(&workspace_handle, AppAction::JumpLatestUnread, cx);
+            }
+        };
         let body = self
             .controller
             .model
@@ -542,19 +566,33 @@ impl Render for UmuxWorkspace {
             .size_full()
             .bg(BACKGROUND)
             .text_color(TEXT)
-            .child(top_bar(title))
+            .child(top_bar(
+                title,
+                on_new_terminal_tab,
+                on_split_right,
+                on_split_down,
+                on_jump_latest_unread,
+            ))
             .when_some(warning, |shell, warning| {
                 shell.child(
                     div()
                         .w_full()
-                        .h(px(30.0))
+                        .h(px(32.0))
                         .px(px(14.0))
                         .flex()
                         .items_center()
-                        .bg(PANEL)
-                        .text_color(MUTED_TEXT)
+                        .bg(WARNING)
+                        .border_b_1()
+                        .border_color(BORDER)
+                        .text_color(WARNING_TEXT)
                         .text_size(px(12.0))
-                        .child(warning),
+                        .child(
+                            div()
+                                .mr(px(8.0))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("!"),
+                        )
+                        .child(div().min_w(px(0.0)).truncate().child(warning)),
                 )
             })
             .child(body)
