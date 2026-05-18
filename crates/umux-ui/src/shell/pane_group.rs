@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use gpui::{div, prelude::*, px, App, Div, IntoElement};
+use gpui::{App, Div, IntoElement, div, prelude::*, px};
 use umux_app::AppController;
 use umux_core::model::{Pane, SplitAxis, SplitTree, SurfaceKind, Workspace};
 use umux_core::{PaneId, SurfaceId};
-use umux_ui_kit::{BACKGROUND, BORDER, MUTED_TEXT, PANEL, TEXT};
+use umux_ui_kit::{BACKGROUND, BORDER, BORDER_STRONG, MUTED_TEXT, PANEL, SURFACE, TEXT};
 
-use crate::shell::{surface_tabs, unsupported_surface_message, RenameEdit};
-use crate::terminal::{terminal_surface, TerminalSurfaceState};
+use crate::shell::{RenameEdit, surface_tabs, unsupported_surface_message};
+use crate::terminal::{TerminalSurfaceState, terminal_surface};
 use crate::view_model;
 
 pub fn pane_group(
@@ -199,9 +199,9 @@ where
         .min_w(px(0.0))
         .min_h(px(0.0))
         .h_full()
-        .border_l_1()
-        .border_color(BORDER)
-        .when(view.selected, |pane| pane.bg(PANEL))
+        .border_1()
+        .border_color(if view.selected { BORDER_STRONG } else { BORDER })
+        .bg(if view.selected { PANEL } else { SURFACE })
         .child({
             let pane_id = pane.id;
             let on_select_surface = (*on_select_surface).clone();
