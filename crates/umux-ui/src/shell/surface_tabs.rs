@@ -44,17 +44,28 @@ pub fn surface_tabs(
         .bg(SURFACE)
         .border_b_1()
         .border_color(BORDER)
-        .children(tabs.into_iter().map(move |tab| {
-            surface_tab(
-                tab,
-                renaming_surface,
-                rename_buffer.clone(),
-                on_select.clone(),
-                on_close.clone(),
-                on_start_rename.clone(),
-                on_rename_edit.clone(),
-            )
-        }))
+        .child(
+            div()
+                .id("surface-tab-strip")
+                .flex()
+                .items_center()
+                .flex_1()
+                .min_w(px(0.0))
+                .h_full()
+                .overflow_x_scroll()
+                .overflow_y_hidden()
+                .children(tabs.into_iter().map(move |tab| {
+                    surface_tab(
+                        tab,
+                        renaming_surface,
+                        rename_buffer.clone(),
+                        on_select.clone(),
+                        on_close.clone(),
+                        on_start_rename.clone(),
+                        on_rename_edit.clone(),
+                    )
+                })),
+        )
         .child(new_tab_control(on_new))
 }
 
