@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use gpui::{Div, IntoElement, div, prelude::*, px};
+use gpui::{App, Div, IntoElement, div, prelude::*, px};
 use umux_app::AppController;
-use umux_core::PaneId;
 use umux_core::model::{Pane, SplitAxis, SplitTree, SurfaceKind, Workspace};
+use umux_core::{PaneId, SurfaceId};
 use umux_ui_kit::{BACKGROUND, BORDER, MUTED_TEXT, PANEL, TEXT};
 
 use crate::shell::{surface_tabs, unsupported_surface_message};
@@ -14,6 +14,9 @@ pub fn pane_group(
     controller: &AppController,
     workspace: &Workspace,
     terminal_surface_state: &TerminalSurfaceState,
+    on_select_surface: impl Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
+    on_close_surface: impl Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
+    on_new_surface: impl Fn(PaneId, &mut App) + Clone + 'static,
 ) -> Div {
     div()
         .flex()
@@ -27,19 +30,36 @@ pub fn pane_group(
             controller,
             workspace,
             terminal_surface_state,
+            &on_select_surface,
+            &on_close_surface,
+            &on_new_surface,
         ))
 }
 
-fn layout_node(
+fn layout_node<OnSelectSurface, OnCloseSurface, OnNewSurface>(
     layout: &SplitTree,
     controller: &AppController,
     workspace: &Workspace,
     terminal_surface_state: &TerminalSurfaceState,
-) -> Div {
+    on_select_surface: &OnSelectSurface,
+    on_close_surface: &OnCloseSurface,
+    on_new_surface: &OnNewSurface,
+) -> Div
+where
+    OnSelectSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
+    OnCloseSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
+    OnNewSurface: Fn(PaneId, &mut App) + Clone + 'static,
+{
     match layout {
-        SplitTree::Leaf(pane_id) => {
-            pane_slot(*pane_id, controller, workspace, terminal_surface_state)
-        }
+        SplitTree::Leaf(pane_id) => pane_slot(
+            *pane_id,
+            controller,
+            workspace,
+            terminal_surface_state,
+            on_select_surface,
+            on_close_surface,
+            on_new_surface,
+        ),
         SplitTree::Split {
             axis,
             first,
@@ -56,34 +76,66 @@ fn layout_node(
                 controller,
                 workspace,
                 terminal_surface_state,
+                on_select_surface,
+                on_close_surface,
+                on_new_surface,
             ))
             .child(pane_slot(
                 *second,
                 controller,
                 workspace,
                 terminal_surface_state,
+                on_select_surface,
+                on_close_surface,
+                on_new_surface,
             )),
     }
 }
 
-fn pane_slot(
+fn pane_slot<OnSelectSurface, OnCloseSurface, OnNewSurface>(
     pane_id: PaneId,
     controller: &AppController,
     workspace: &Workspace,
     terminal_surface_state: &TerminalSurfaceState,
-) -> Div {
+    on_select_surface: &OnSelectSurface,
+    on_close_surface: &OnCloseSurface,
+    on_new_surface: &OnNewSurface,
+) -> Div
+where
+    OnSelectSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
+    OnCloseSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
+    OnNewSurface: Fn(PaneId, &mut App) + Clone + 'static,
+{
     workspace
         .pane(pane_id)
-        .map(|pane| pane_view(pane, controller, workspace, terminal_surface_state))
+        .map(|pane| {
+            pane_view(
+                pane,
+                controller,
+                workspace,
+                terminal_surface_state,
+                on_select_surface,
+                on_close_surface,
+                on_new_surface,
+            )
+        })
         .unwrap_or_else(|| missing_pane_view(pane_id))
 }
 
-fn pane_view(
+fn pane_view<OnSelectSurface, OnCloseSurface, OnNewSurface>(
     pane: &Pane,
     controller: &AppController,
     workspace: &Workspace,
     terminal_surface_state: &TerminalSurfaceState,
-) -> Div {
+    on_select_surface: &OnSelectSurface,
+    on_close_surface: &OnCloseSurface,
+    on_new_surface: &OnNewSurface,
+) -> Div
+where
+    OnSelectSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
+    OnCloseSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
+    OnNewSurface: Fn(PaneId, &mut App) + Clone + 'static,
+{
     let view = view_model::pane_view(pane, workspace.selected_pane);
     let selected_surface = pane.surface(pane.selected_surface);
     let body = selected_surface
@@ -108,7 +160,18 @@ fn pane_view(
         .border_l_1()
         .border_color(BORDER)
         .when(view.selected, |pane| pane.bg(PANEL))
-        .child(surface_tabs(view.tabs))
+        .child({
+            let pane_id = pane.id;
+            let on_select_surface = (*on_select_surface).clone();
+            let on_close_surface = (*on_close_surface).clone();
+            let on_new_surface = (*on_new_surface).clone();
+            surface_tabs(
+                view.tabs,
+                move |surface_id, cx| on_select_surface(pane_id, surface_id, cx),
+                move |surface_id, cx| on_close_surface(pane_id, surface_id, cx),
+                move |cx| on_new_surface(pane_id, cx),
+            )
+        })
         .child(body)
 }
 

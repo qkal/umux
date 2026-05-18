@@ -2,9 +2,12 @@
 
 use std::{sync::Arc, time::Duration};
 
-use gpui::{Context, IntoElement, Render, Task, Window, div, prelude::*, px};
-use umux_app::{AppAction, AppController, SessionStore, TerminalEntry, TerminalEntrySnapshot};
-use umux_core::{SurfaceId, SurfaceKind};
+use gpui::{App, Context, IntoElement, Render, Task, WeakEntity, Window, div, prelude::*, px};
+use umux_app::{
+    AppAction, AppController, AppControllerError, SessionStore, TerminalEntry,
+    TerminalEntrySnapshot,
+};
+use umux_core::{PaneId, SurfaceId, SurfaceKind, WorkspaceId};
 use umux_terminal::TerminalStatus;
 use umux_ui_kit::theme::{BACKGROUND, MUTED_TEXT, PANEL, TEXT};
 
@@ -71,11 +74,45 @@ impl UmuxWorkspace {
         Ok(outcome)
     }
 
+    pub(crate) fn dispatch_many(
+        &mut self,
+        actions: impl IntoIterator<Item = AppAction>,
+    ) -> Result<(), AppControllerError> {
+        for action in actions {
+            self.dispatch(action)?;
+        }
+        Ok(())
+    }
+
     fn dispatch_and_notify(&mut self, action: AppAction, cx: &mut Context<Self>) {
-        if let Err(error) = self.dispatch(action) {
+        self.dispatch_many_and_notify([action], cx);
+    }
+
+    fn dispatch_many_and_notify(
+        &mut self,
+        actions: impl IntoIterator<Item = AppAction>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.dispatch_many(actions) {
             tracing::warn!(%error, "failed to dispatch workspace action");
         }
         cx.notify();
+    }
+
+    fn dispatch_from_weak(handle: &WeakEntity<Self>, action: AppAction, cx: &mut App) {
+        Self::dispatch_actions_from_weak(handle, vec![action], cx);
+    }
+
+    fn dispatch_actions_from_weak(
+        handle: &WeakEntity<Self>,
+        actions: Vec<AppAction>,
+        cx: &mut App,
+    ) {
+        if let Err(error) = handle.update(cx, move |workspace, cx| {
+            workspace.dispatch_many_and_notify(actions, cx);
+        }) {
+            tracing::debug!(%error, "workspace interaction target was released");
+        }
     }
 
     fn materialize_visible_terminals(&mut self) {
@@ -286,6 +323,66 @@ impl Render for UmuxWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.selected_workspace_title();
         let warning = self.startup_warning.clone();
+        let workspace_handle = cx.weak_entity();
+        let on_select_workspace = {
+            let workspace_handle = workspace_handle.clone();
+            move |workspace_id: WorkspaceId, cx: &mut App| {
+                Self::dispatch_from_weak(
+                    &workspace_handle,
+                    AppAction::SelectWorkspace(workspace_id),
+                    cx,
+                );
+            }
+        };
+        let on_new_workspace = {
+            let workspace_handle = workspace_handle.clone();
+            move |cx: &mut App| {
+                Self::dispatch_from_weak(
+                    &workspace_handle,
+                    AppAction::NewWorkspace {
+                        cwd: crate::startup::current_dir_cwd(),
+                        title: None,
+                    },
+                    cx,
+                );
+            }
+        };
+        let on_select_surface = {
+            let workspace_handle = workspace_handle.clone();
+            move |pane_id: PaneId, surface_id: SurfaceId, cx: &mut App| {
+                Self::dispatch_actions_from_weak(
+                    &workspace_handle,
+                    vec![
+                        AppAction::SelectPane(pane_id),
+                        AppAction::SelectSurface(surface_id),
+                    ],
+                    cx,
+                );
+            }
+        };
+        let on_close_surface = {
+            let workspace_handle = workspace_handle.clone();
+            move |pane_id: PaneId, surface_id: SurfaceId, cx: &mut App| {
+                Self::dispatch_actions_from_weak(
+                    &workspace_handle,
+                    vec![
+                        AppAction::SelectPane(pane_id),
+                        AppAction::CloseSurface(surface_id),
+                    ],
+                    cx,
+                );
+            }
+        };
+        let on_new_surface = {
+            let workspace_handle = workspace_handle.clone();
+            move |pane_id: PaneId, cx: &mut App| {
+                Self::dispatch_actions_from_weak(
+                    &workspace_handle,
+                    vec![AppAction::SelectPane(pane_id), AppAction::NewTerminalTab],
+                    cx,
+                );
+            }
+        };
         let body = self
             .controller
             .model
@@ -299,7 +396,11 @@ impl Render for UmuxWorkspace {
                     .flex()
                     .flex_1()
                     .w_full()
-                    .child(workspace_rail(rows))
+                    .child(workspace_rail(
+                        rows,
+                        on_select_workspace.clone(),
+                        on_new_workspace.clone(),
+                    ))
                     .child(
                         selected_workspace
                             .as_ref()
@@ -308,6 +409,9 @@ impl Render for UmuxWorkspace {
                                     &self.controller,
                                     workspace,
                                     &self.terminal_surface_state,
+                                    on_select_surface.clone(),
+                                    on_close_surface.clone(),
+                                    on_new_surface.clone(),
                                 )
                             })
                             .unwrap_or_else(|| {
@@ -372,7 +476,7 @@ mod tests {
 
     use camino::Utf8PathBuf;
     use umux_app::{AppAction, AppController, SessionStore, TerminalEntrySnapshot};
-    use umux_core::{AppModel, SurfaceId};
+    use umux_core::{AppModel, SurfaceId, model::SplitAxis};
     use umux_terminal::{TerminalCursor, TerminalHealth, TerminalRendererSnapshot, TerminalStatus};
 
     use crate::startup::StartupState;
@@ -428,6 +532,85 @@ mod tests {
 
         assert!(workspace.controller.terminals.contains(surface_id));
         assert_eq!(workspace.controller.terminals.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_many_selects_surface_in_target_split_pane() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let first_pane = model.selected_pane().unwrap().id;
+        let first_surface = model.selected_pane().unwrap().selected_surface;
+        let second_pane = model.split_selected_pane(SplitAxis::Vertical).unwrap();
+        assert_eq!(model.selected_pane().unwrap().id, second_pane);
+
+        let (_temp_dir, mut workspace) = workspace_from_model("split-select-surface", model);
+
+        workspace
+            .dispatch_many([
+                AppAction::SelectPane(first_pane),
+                AppAction::SelectSurface(first_surface),
+            ])
+            .unwrap();
+
+        let selected_pane = workspace.controller.model.selected_pane().unwrap();
+        assert_eq!(selected_pane.id, first_pane);
+        assert_eq!(selected_pane.selected_surface, first_surface);
+    }
+
+    #[test]
+    fn dispatch_many_closes_surface_in_target_split_pane() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let first_pane = model.selected_pane().unwrap().id;
+        let first_surface = model.selected_pane().unwrap().selected_surface;
+        let surface_to_close = model.open_terminal_surface().unwrap();
+        let second_pane = model.split_selected_pane(SplitAxis::Vertical).unwrap();
+        assert_eq!(model.selected_pane().unwrap().id, second_pane);
+
+        let (_temp_dir, mut workspace) = workspace_from_model("split-close-surface", model);
+
+        workspace
+            .dispatch_many([
+                AppAction::SelectPane(first_pane),
+                AppAction::CloseSurface(surface_to_close),
+            ])
+            .unwrap();
+
+        let selected_workspace = workspace.controller.model.selected_workspace().unwrap();
+        let first = selected_workspace.pane(first_pane).unwrap();
+        assert_eq!(selected_workspace.selected_pane, first_pane);
+        assert_eq!(first.selected_surface, first_surface);
+        assert!(
+            !first
+                .surfaces
+                .iter()
+                .any(|surface| surface.id == surface_to_close)
+        );
+    }
+
+    #[test]
+    fn dispatch_many_opens_terminal_tab_in_target_split_pane() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let first_pane = model.selected_pane().unwrap().id;
+        let first_count = model.selected_pane().unwrap().surfaces.len();
+        let second_pane = model.split_selected_pane(SplitAxis::Vertical).unwrap();
+        let second_count = model.selected_pane().unwrap().surfaces.len();
+        assert_eq!(model.selected_pane().unwrap().id, second_pane);
+
+        let (_temp_dir, mut workspace) = workspace_from_model("split-new-terminal-tab", model);
+
+        workspace
+            .dispatch_many([AppAction::SelectPane(first_pane), AppAction::NewTerminalTab])
+            .unwrap();
+
+        let selected_workspace = workspace.controller.model.selected_workspace().unwrap();
+        let first = selected_workspace.pane(first_pane).unwrap();
+        let second = selected_workspace.pane(second_pane).unwrap();
+        assert_eq!(selected_workspace.selected_pane, first_pane);
+        assert_eq!(first.surfaces.len(), first_count + 1);
+        assert_eq!(second.surfaces.len(), second_count);
+        assert_eq!(
+            first.selected_surface,
+            first.surfaces.last().expect("new terminal surface").id
+        );
     }
 
     #[test]
@@ -507,6 +690,17 @@ mod tests {
                 path: Utf8PathBuf::from_path_buf(path).unwrap(),
             }
         }
+    }
+
+    fn workspace_from_model(name: &str, model: AppModel) -> (TempSessionDir, UmuxWorkspace) {
+        let temp_dir = TempSessionDir::new(name);
+        let store = SessionStore::new(temp_dir.path.join("session.json"));
+        let startup = StartupState {
+            controller: AppController::new_deferred_terminals(model).unwrap(),
+            warning: None,
+        };
+        let workspace = UmuxWorkspace::new(startup, store);
+        (temp_dir, workspace)
     }
 
     impl Drop for TempSessionDir {
