@@ -321,6 +321,12 @@ impl BlockedHttpClient {
     }
 }
 
+impl Default for BlockedHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HttpClient for BlockedHttpClient {
     fn send(
         &self,

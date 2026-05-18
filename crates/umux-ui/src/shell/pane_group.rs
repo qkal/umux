@@ -10,6 +10,7 @@ use crate::shell::{RenameEdit, surface_tabs, unsupported_surface_message};
 use crate::terminal::{TerminalSurfaceState, terminal_surface};
 use crate::view_model;
 
+#[allow(clippy::too_many_arguments)]
 pub fn pane_group(
     controller: &AppController,
     workspace: &Workspace,
@@ -44,6 +45,7 @@ pub fn pane_group(
         ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_node<OnSelectSurface, OnCloseSurface, OnNewSurface, OnStartRename, OnRenameEdit>(
     layout: &SplitTree,
     controller: &AppController,
@@ -118,6 +120,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pane_slot<OnSelectSurface, OnCloseSurface, OnNewSurface, OnStartRename, OnRenameEdit>(
     pane_id: PaneId,
     controller: &AppController,
@@ -158,6 +161,7 @@ where
         .unwrap_or_else(|| missing_pane_view(pane_id))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pane_view<OnSelectSurface, OnCloseSurface, OnNewSurface, OnStartRename, OnRenameEdit>(
     pane: &Pane,
     controller: &AppController,

@@ -141,7 +141,7 @@ impl AppController {
 
         for surface_id in surface_ids {
             self.spawn_surface(surface_id, &mut outcome)?;
-            materialized.extend(outcome.spawned_surfaces.drain(..));
+            materialized.append(&mut outcome.spawned_surfaces);
         }
 
         Ok(materialized)
