@@ -119,9 +119,24 @@ Required changes:
 
 - keep brand on the left
 - show current workspace as contextual text
-- add compact action affordances for new tab, split, and unread navigation
+- add compact clickable action affordances for new tab, split right, split down, and jump latest unread
 - use muted labels and subtle borders so controls feel integrated
-- keep controls informational if wiring them would expand scope
+- wire those controls through existing `UmuxWorkspace` callbacks and `AppAction` paths, not through new model behavior
+- use cursor and hover affordances so clickable controls do not feel inert
+
+Expected callback shape:
+
+```text
+top_bar(
+  title,
+  on_new_terminal_tab,
+  on_split_right,
+  on_split_down,
+  on_jump_latest_unread,
+)
+```
+
+These actions already exist as GPUI actions and controller dispatches, so the top bar should expose them rather than rendering dead chrome.
 
 ### Workspace Rail
 
@@ -142,10 +157,12 @@ Required changes:
 
 - add a small section label
 - make selected row clearly selected with active fill and accent mark
-- keep unread badges visually distinct
+- keep unread badges visually distinct as a separate element from the label
 - replace `+ ws` with a compact add control
 - make text truncation predictable
 - remove duplicate unread `*` from labels if a visual badge is already shown
+- use stable row height and badge dimensions so unread and selected states do not resize the rail
+- use cursor and hover affordances on selectable rows and add controls
 
 ### Pane Group
 
@@ -165,6 +182,7 @@ Required changes:
 - inactive panes stay quiet but still separated
 - pane backgrounds use the editor/terminal surface token
 - split borders stay thin and consistent
+- border widths remain stable across selected and unselected panes so focus changes do not shift layout
 
 ### Surface Tabs
 
@@ -180,12 +198,15 @@ Required changes:
 
 - selected tab has active fill and clear text color
 - inactive tabs use muted text and hover fill
-- unread appears once, preferably as a compact marker/dot-like indicator
+- unread appears once as a separate compact marker element, not by mutating the title string
 - close control is stable and does not shift tab layout unexpectedly
 - rename control is compact and available only where it already is today
 - inline rename editor has a stronger border and stable width
+- tabs keep stable height, close-control width, and marker dimensions across selected, unread, and rename states
+- clickable tab controls use cursor and hover affordances
 
 Source files should remain ASCII unless there is a strong reason to use Unicode. ASCII-safe controls such as `+`, `x`, and short labels are acceptable for this pass.
+If the unread marker is ASCII, it should still be rendered as its own child element, not appended to `label`.
 
 ### Warning Strip
 
@@ -226,6 +247,8 @@ The polish should work with the existing callbacks for:
 - starting and applying tab rename edits
 - app-level GPUI actions already registered in `UmuxWorkspace`
 
+Top-bar buttons should reuse the same callback pattern already used by `workspace_rail` and `surface_tabs`: closures owned by `UmuxWorkspace`, passed into the shell component, and dispatched through `dispatch_from_weak` or `dispatch_actions_from_weak`.
+
 ## Files
 
 Expected implementation scope:
@@ -242,12 +265,14 @@ crates/umux-ui/src/view_model.rs
 ```
 
 `view_model.rs` should stop adding unread suffixes to labels when the rendering components already receive `unread` booleans and draw a marker.
+Existing `umux-ui-kit` tab helpers may remain for compatibility, but the refreshed shell must not use a helper that appends unread text and also render a marker.
 
 ## Testing And Verification
 
 Required checks:
 
 ```text
+cargo fmt --check
 cargo test -p umux-ui-kit
 cargo test -p umux-ui view_model
 cargo test -p umux-ui shell
@@ -265,6 +290,7 @@ Manual verification should confirm:
 - top bar, rail, tabs, warning strip, and panes use the refreshed theme coherently
 - selected workspace and selected pane are obvious
 - unread state appears once per row/tab
+- top-bar controls for new tab, split right, split down, and latest unread are clickable
 - close, add, and rename controls remain clickable
 - inline rename still accepts text, backspace, enter, and escape
 - terminal input still works after the visual changes
@@ -288,6 +314,6 @@ The pass is complete when:
 - the shell reads as a Zed-inspired terminal workspace
 - selected workspace, selected tab, and selected pane are clearly distinct
 - unread and warning states are visible without duplicate signaling
+- clickable controls have hover/cursor feedback and do not render as inert decoration
 - existing shell interactions still work
 - the required Rust checks pass, or any failures are documented with concrete blockers
-
