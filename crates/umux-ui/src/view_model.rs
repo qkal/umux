@@ -14,6 +14,7 @@ pub struct WorkspaceRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceTab {
     pub id: SurfaceId,
+    pub title: String,
     pub label: String,
     pub selected: bool,
     pub unread: bool,
@@ -64,6 +65,7 @@ pub fn pane_view(pane: &Pane, selected_pane: PaneId) -> PaneView {
             .iter()
             .map(|surface| SurfaceTab {
                 id: surface.id,
+                title: surface.title.clone(),
                 label: surface_label(surface),
                 selected: surface.id == pane.selected_surface,
                 unread: surface.unread,

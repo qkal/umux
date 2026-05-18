@@ -12,7 +12,7 @@ use umux_terminal::TerminalStatus;
 use umux_ui_kit::theme::{BACKGROUND, MUTED_TEXT, PANEL, TEXT};
 
 use crate::actions;
-use crate::shell::{pane_group, top_bar, workspace_rail};
+use crate::shell::{RenameEdit, pane_group, top_bar, workspace_rail};
 use crate::startup::StartupState;
 use crate::terminal::TerminalSurfaceState;
 use crate::view_model::workspace_rows;
@@ -21,6 +21,8 @@ pub struct UmuxWorkspace {
     pub controller: AppController,
     pub store: Arc<SessionStore>,
     pub startup_warning: Option<String>,
+    pub renaming_surface: Option<SurfaceId>,
+    pub rename_buffer: String,
     terminal_surface_state: TerminalSurfaceState,
     terminal_refresh_state: Vec<TerminalRefreshEntry>,
     _terminal_refresh_task: Option<Task<()>>,
@@ -32,6 +34,8 @@ impl UmuxWorkspace {
             controller: startup.controller,
             store: Arc::new(store),
             startup_warning: startup.warning,
+            renaming_surface: None,
+            rename_buffer: String::new(),
             terminal_surface_state: TerminalSurfaceState::new(),
             terminal_refresh_state: Vec::new(),
             _terminal_refresh_task: None,
@@ -103,16 +107,65 @@ impl UmuxWorkspace {
         Self::dispatch_actions_from_weak(handle, vec![action], cx);
     }
 
+    fn update_from_weak(
+        handle: &WeakEntity<Self>,
+        update: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut App,
+    ) {
+        if let Err(error) = handle.update(cx, update) {
+            tracing::debug!(%error, "workspace interaction target was released");
+        }
+    }
+
     fn dispatch_actions_from_weak(
         handle: &WeakEntity<Self>,
         actions: Vec<AppAction>,
         cx: &mut App,
     ) {
-        if let Err(error) = handle.update(cx, move |workspace, cx| {
-            workspace.dispatch_many_and_notify(actions, cx);
-        }) {
-            tracing::debug!(%error, "workspace interaction target was released");
+        Self::update_from_weak(
+            handle,
+            move |workspace, cx| {
+                workspace.dispatch_many_and_notify(actions, cx);
+            },
+            cx,
+        );
+    }
+
+    fn start_surface_rename(&mut self, surface_id: SurfaceId, title: String) {
+        self.renaming_surface = Some(surface_id);
+        self.rename_buffer = title;
+    }
+
+    fn cancel_surface_rename(&mut self) {
+        self.renaming_surface = None;
+        self.rename_buffer.clear();
+    }
+
+    pub(crate) fn apply_rename_edit(
+        &mut self,
+        surface_id: SurfaceId,
+        edit: RenameEdit,
+    ) -> Result<(), AppControllerError> {
+        if self.renaming_surface != Some(surface_id) {
+            return Ok(());
         }
+
+        match edit {
+            RenameEdit::Insert(ch) => self.rename_buffer.push(ch),
+            RenameEdit::Backspace => {
+                self.rename_buffer.pop();
+            }
+            RenameEdit::Commit => {
+                let title = self.rename_buffer.trim().to_string();
+                if !title.is_empty() {
+                    self.dispatch(AppAction::RenameSurface { surface_id, title })?;
+                }
+                self.cancel_surface_rename();
+            }
+            RenameEdit::Cancel => self.cancel_surface_rename(),
+        }
+
+        Ok(())
     }
 
     fn materialize_visible_terminals(&mut self) {
@@ -323,6 +376,8 @@ impl Render for UmuxWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.selected_workspace_title();
         let warning = self.startup_warning.clone();
+        let renaming_surface = self.renaming_surface;
+        let rename_buffer = self.rename_buffer.clone();
         let workspace_handle = cx.weak_entity();
         let on_select_workspace = {
             let workspace_handle = workspace_handle.clone();
@@ -383,6 +438,41 @@ impl Render for UmuxWorkspace {
                 );
             }
         };
+        let on_start_rename = {
+            let workspace_handle = workspace_handle.clone();
+            move |pane_id: PaneId, surface_id: SurfaceId, title: String, cx: &mut App| {
+                Self::update_from_weak(
+                    &workspace_handle,
+                    move |workspace, cx| {
+                        if let Err(error) = workspace.dispatch_many([
+                            AppAction::SelectPane(pane_id),
+                            AppAction::SelectSurface(surface_id),
+                        ]) {
+                            tracing::warn!(%error, "failed to select surface before rename");
+                        } else {
+                            workspace.start_surface_rename(surface_id, title);
+                        }
+                        cx.notify();
+                    },
+                    cx,
+                );
+            }
+        };
+        let on_rename_edit = {
+            let workspace_handle = workspace_handle.clone();
+            move |surface_id: SurfaceId, edit: RenameEdit, cx: &mut App| {
+                Self::update_from_weak(
+                    &workspace_handle,
+                    move |workspace, cx| {
+                        if let Err(error) = workspace.apply_rename_edit(surface_id, edit) {
+                            tracing::warn!(%error, "failed to apply surface rename edit");
+                        }
+                        cx.notify();
+                    },
+                    cx,
+                );
+            }
+        };
         let body = self
             .controller
             .model
@@ -409,9 +499,13 @@ impl Render for UmuxWorkspace {
                                     &self.controller,
                                     workspace,
                                     &self.terminal_surface_state,
+                                    renaming_surface,
+                                    rename_buffer.clone(),
                                     on_select_surface.clone(),
                                     on_close_surface.clone(),
                                     on_new_surface.clone(),
+                                    on_start_rename.clone(),
+                                    on_rename_edit.clone(),
                                 )
                             })
                             .unwrap_or_else(|| {
@@ -479,6 +573,7 @@ mod tests {
     use umux_core::{AppModel, SurfaceId, model::SplitAxis};
     use umux_terminal::{TerminalCursor, TerminalHealth, TerminalRendererSnapshot, TerminalStatus};
 
+    use crate::shell::RenameEdit;
     use crate::startup::StartupState;
 
     use super::UmuxWorkspace;
@@ -614,6 +709,93 @@ mod tests {
     }
 
     #[test]
+    fn rename_edit_updates_active_buffer() {
+        let temp_dir = TempSessionDir::new("rename-edit-buffer");
+        let store = SessionStore::new(temp_dir.path.join("session.json"));
+        let startup = StartupState {
+            controller: AppController::new_deferred_terminals(AppModel::new("C:/work/alpha"))
+                .unwrap(),
+            warning: None,
+        };
+        let surface_id = startup
+            .controller
+            .model
+            .selected_pane()
+            .unwrap()
+            .selected_surface;
+        let mut workspace = UmuxWorkspace::new(startup, store);
+        workspace.start_surface_rename(surface_id, String::new());
+
+        workspace
+            .apply_rename_edit(surface_id, RenameEdit::Insert('a'))
+            .unwrap();
+        workspace
+            .apply_rename_edit(surface_id, RenameEdit::Insert('b'))
+            .unwrap();
+        workspace
+            .apply_rename_edit(surface_id, RenameEdit::Backspace)
+            .unwrap();
+
+        assert_eq!(workspace.rename_buffer, "a");
+        assert_eq!(workspace.renaming_surface, Some(surface_id));
+    }
+
+    #[test]
+    fn rename_commit_trims_and_persists_surface_title() {
+        let temp_dir = TempSessionDir::new("rename-commit");
+        let session_path = temp_dir.path.join("session.json");
+        let store = SessionStore::new(session_path.clone());
+        let startup = StartupState {
+            controller: AppController::new_deferred_terminals(AppModel::new("C:/work/alpha"))
+                .unwrap(),
+            warning: None,
+        };
+        let surface_id = startup
+            .controller
+            .model
+            .selected_pane()
+            .unwrap()
+            .selected_surface;
+        let mut workspace = UmuxWorkspace::new(startup, store);
+        workspace.start_surface_rename(surface_id, "Terminal".to_string());
+        workspace.rename_buffer = "  cargo test  ".to_string();
+
+        workspace
+            .apply_rename_edit(surface_id, RenameEdit::Commit)
+            .unwrap();
+
+        assert_eq!(surface_title(&workspace, surface_id), "cargo test");
+        assert_eq!(workspace.renaming_surface, None);
+        assert!(workspace.rename_buffer.is_empty());
+
+        let loaded = SessionStore::new(session_path)
+            .load_model()
+            .unwrap()
+            .unwrap();
+        assert_eq!(model_surface_title(&loaded, surface_id), "cargo test");
+    }
+
+    #[test]
+    fn rename_commit_ignores_blank_titles() {
+        let mut model = AppModel::new("C:/work/alpha");
+        let surface_id = model.selected_pane().unwrap().selected_surface;
+        model
+            .rename_surface(surface_id, "keep me".to_string())
+            .unwrap();
+        let (_temp_dir, mut workspace) = workspace_from_model("rename-blank", model);
+        workspace.start_surface_rename(surface_id, "keep me".to_string());
+        workspace.rename_buffer = "   ".to_string();
+
+        workspace
+            .apply_rename_edit(surface_id, RenameEdit::Commit)
+            .unwrap();
+
+        assert_eq!(surface_title(&workspace, surface_id), "keep me");
+        assert_eq!(workspace.renaming_surface, None);
+        assert!(workspace.rename_buffer.is_empty());
+    }
+
+    #[test]
     fn terminal_refresh_state_tracks_snapshot_status_and_last_error_changes() {
         let mut health = TerminalHealth::running("pwsh", "C:/work/alpha", 80, 24);
         health.status = TerminalStatus::Failed;
@@ -701,6 +883,23 @@ mod tests {
         };
         let workspace = UmuxWorkspace::new(startup, store);
         (temp_dir, workspace)
+    }
+
+    fn surface_title(workspace: &UmuxWorkspace, surface_id: SurfaceId) -> String {
+        model_surface_title(&workspace.controller.model, surface_id)
+    }
+
+    fn model_surface_title(model: &AppModel, surface_id: SurfaceId) -> String {
+        model
+            .selected_workspace()
+            .unwrap()
+            .panes
+            .iter()
+            .flat_map(|pane| pane.surfaces.iter())
+            .find(|surface| surface.id == surface_id)
+            .unwrap()
+            .title
+            .clone()
     }
 
     impl Drop for TempSessionDir {

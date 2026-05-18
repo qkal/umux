@@ -6,7 +6,7 @@ use umux_core::model::{Pane, SplitAxis, SplitTree, SurfaceKind, Workspace};
 use umux_core::{PaneId, SurfaceId};
 use umux_ui_kit::{BACKGROUND, BORDER, MUTED_TEXT, PANEL, TEXT};
 
-use crate::shell::{surface_tabs, unsupported_surface_message};
+use crate::shell::{RenameEdit, surface_tabs, unsupported_surface_message};
 use crate::terminal::{TerminalSurfaceState, terminal_surface};
 use crate::view_model;
 
@@ -14,9 +14,13 @@ pub fn pane_group(
     controller: &AppController,
     workspace: &Workspace,
     terminal_surface_state: &TerminalSurfaceState,
+    renaming_surface: Option<SurfaceId>,
+    rename_buffer: String,
     on_select_surface: impl Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
     on_close_surface: impl Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
     on_new_surface: impl Fn(PaneId, &mut App) + Clone + 'static,
+    on_start_rename: impl Fn(PaneId, SurfaceId, String, &mut App) + Clone + 'static,
+    on_rename_edit: impl Fn(SurfaceId, RenameEdit, &mut App) + Clone + 'static,
 ) -> Div {
     div()
         .flex()
@@ -30,25 +34,35 @@ pub fn pane_group(
             controller,
             workspace,
             terminal_surface_state,
+            renaming_surface,
+            rename_buffer,
             &on_select_surface,
             &on_close_surface,
             &on_new_surface,
+            &on_start_rename,
+            &on_rename_edit,
         ))
 }
 
-fn layout_node<OnSelectSurface, OnCloseSurface, OnNewSurface>(
+fn layout_node<OnSelectSurface, OnCloseSurface, OnNewSurface, OnStartRename, OnRenameEdit>(
     layout: &SplitTree,
     controller: &AppController,
     workspace: &Workspace,
     terminal_surface_state: &TerminalSurfaceState,
+    renaming_surface: Option<SurfaceId>,
+    rename_buffer: String,
     on_select_surface: &OnSelectSurface,
     on_close_surface: &OnCloseSurface,
     on_new_surface: &OnNewSurface,
+    on_start_rename: &OnStartRename,
+    on_rename_edit: &OnRenameEdit,
 ) -> Div
 where
     OnSelectSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
     OnCloseSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
     OnNewSurface: Fn(PaneId, &mut App) + Clone + 'static,
+    OnStartRename: Fn(PaneId, SurfaceId, String, &mut App) + Clone + 'static,
+    OnRenameEdit: Fn(SurfaceId, RenameEdit, &mut App) + Clone + 'static,
 {
     match layout {
         SplitTree::Leaf(pane_id) => pane_slot(
@@ -56,9 +70,13 @@ where
             controller,
             workspace,
             terminal_surface_state,
+            renaming_surface,
+            rename_buffer,
             on_select_surface,
             on_close_surface,
             on_new_surface,
+            on_start_rename,
+            on_rename_edit,
         ),
         SplitTree::Split {
             axis,
@@ -76,35 +94,49 @@ where
                 controller,
                 workspace,
                 terminal_surface_state,
+                renaming_surface,
+                rename_buffer.clone(),
                 on_select_surface,
                 on_close_surface,
                 on_new_surface,
+                on_start_rename,
+                on_rename_edit,
             ))
             .child(pane_slot(
                 *second,
                 controller,
                 workspace,
                 terminal_surface_state,
+                renaming_surface,
+                rename_buffer,
                 on_select_surface,
                 on_close_surface,
                 on_new_surface,
+                on_start_rename,
+                on_rename_edit,
             )),
     }
 }
 
-fn pane_slot<OnSelectSurface, OnCloseSurface, OnNewSurface>(
+fn pane_slot<OnSelectSurface, OnCloseSurface, OnNewSurface, OnStartRename, OnRenameEdit>(
     pane_id: PaneId,
     controller: &AppController,
     workspace: &Workspace,
     terminal_surface_state: &TerminalSurfaceState,
+    renaming_surface: Option<SurfaceId>,
+    rename_buffer: String,
     on_select_surface: &OnSelectSurface,
     on_close_surface: &OnCloseSurface,
     on_new_surface: &OnNewSurface,
+    on_start_rename: &OnStartRename,
+    on_rename_edit: &OnRenameEdit,
 ) -> Div
 where
     OnSelectSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
     OnCloseSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
     OnNewSurface: Fn(PaneId, &mut App) + Clone + 'static,
+    OnStartRename: Fn(PaneId, SurfaceId, String, &mut App) + Clone + 'static,
+    OnRenameEdit: Fn(SurfaceId, RenameEdit, &mut App) + Clone + 'static,
 {
     workspace
         .pane(pane_id)
@@ -114,27 +146,37 @@ where
                 controller,
                 workspace,
                 terminal_surface_state,
+                renaming_surface,
+                rename_buffer,
                 on_select_surface,
                 on_close_surface,
                 on_new_surface,
+                on_start_rename,
+                on_rename_edit,
             )
         })
         .unwrap_or_else(|| missing_pane_view(pane_id))
 }
 
-fn pane_view<OnSelectSurface, OnCloseSurface, OnNewSurface>(
+fn pane_view<OnSelectSurface, OnCloseSurface, OnNewSurface, OnStartRename, OnRenameEdit>(
     pane: &Pane,
     controller: &AppController,
     workspace: &Workspace,
     terminal_surface_state: &TerminalSurfaceState,
+    renaming_surface: Option<SurfaceId>,
+    rename_buffer: String,
     on_select_surface: &OnSelectSurface,
     on_close_surface: &OnCloseSurface,
     on_new_surface: &OnNewSurface,
+    on_start_rename: &OnStartRename,
+    on_rename_edit: &OnRenameEdit,
 ) -> Div
 where
     OnSelectSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
     OnCloseSurface: Fn(PaneId, SurfaceId, &mut App) + Clone + 'static,
     OnNewSurface: Fn(PaneId, &mut App) + Clone + 'static,
+    OnStartRename: Fn(PaneId, SurfaceId, String, &mut App) + Clone + 'static,
+    OnRenameEdit: Fn(SurfaceId, RenameEdit, &mut App) + Clone + 'static,
 {
     let view = view_model::pane_view(pane, workspace.selected_pane);
     let selected_surface = pane.surface(pane.selected_surface);
@@ -165,11 +207,17 @@ where
             let on_select_surface = (*on_select_surface).clone();
             let on_close_surface = (*on_close_surface).clone();
             let on_new_surface = (*on_new_surface).clone();
+            let on_start_rename = (*on_start_rename).clone();
+            let on_rename_edit = (*on_rename_edit).clone();
             surface_tabs(
                 view.tabs,
+                renaming_surface,
+                rename_buffer,
                 move |surface_id, cx| on_select_surface(pane_id, surface_id, cx),
                 move |surface_id, cx| on_close_surface(pane_id, surface_id, cx),
                 move |cx| on_new_surface(pane_id, cx),
+                move |surface_id, title, cx| on_start_rename(pane_id, surface_id, title, cx),
+                on_rename_edit,
             )
         })
         .child(body)
