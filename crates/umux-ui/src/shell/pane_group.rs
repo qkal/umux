@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use gpui::{App, Div, IntoElement, div, prelude::*, px};
+use gpui::{div, prelude::*, px, App, Div, IntoElement};
 use umux_app::AppController;
 use umux_core::model::{Pane, SplitAxis, SplitTree, SurfaceKind, Workspace};
 use umux_core::{PaneId, SurfaceId};
 use umux_ui_kit::{BACKGROUND, BORDER, MUTED_TEXT, PANEL, TEXT};
 
-use crate::shell::{RenameEdit, surface_tabs, unsupported_surface_message};
-use crate::terminal::{TerminalSurfaceState, terminal_surface};
+use crate::shell::{surface_tabs, unsupported_surface_message, RenameEdit};
+use crate::terminal::{terminal_surface, TerminalSurfaceState};
 use crate::view_model;
 
 pub fn pane_group(
@@ -210,6 +210,7 @@ where
             let on_start_rename = (*on_start_rename).clone();
             let on_rename_edit = (*on_rename_edit).clone();
             surface_tabs(
+                pane_id,
                 view.tabs,
                 renaming_surface,
                 rename_buffer,

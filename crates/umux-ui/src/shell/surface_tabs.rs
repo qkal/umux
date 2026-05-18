@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use gpui::{div, prelude::*, px, App, Div, Keystroke, MouseButton};
-use umux_core::SurfaceId;
+use umux_core::{PaneId, SurfaceId};
 use umux_ui_kit::{
     ACTIVE, BORDER, BORDER_STRONG, DIM_TEXT, ELEVATED, HOVER, MUTED_TEXT, PANEL, SURFACE, TEXT,
     UNREAD_BLUE,
@@ -27,6 +27,7 @@ pub enum RenameEdit {
 }
 
 pub fn surface_tabs(
+    pane_id: PaneId,
     tabs: Vec<SurfaceTab>,
     renaming_surface: Option<SurfaceId>,
     rename_buffer: String,
@@ -46,7 +47,7 @@ pub fn surface_tabs(
         .border_color(BORDER)
         .child(
             div()
-                .id("surface-tab-strip")
+                .id(("surface-tab-strip", pane_id.0))
                 .flex()
                 .items_center()
                 .flex_1()
